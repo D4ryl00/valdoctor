@@ -5,8 +5,16 @@ and your logs; it tells you what went wrong.
 
 ## Install
 
+Install to `$GOPATH/bin` (must be in your `PATH`):
+
 ```sh
 make install
+```
+
+Or build a local binary in `build/valdoctor`:
+
+```sh
+make build
 ```
 
 ## Usage
