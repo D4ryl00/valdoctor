@@ -1,10 +1,12 @@
 package app
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -144,7 +146,7 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 	warnings := append([]string(nil), metadataWarnings...)
 
 	for _, source := range sources {
-		data, readErr := os.ReadFile(source.Path)
+		data, readErr := readLogFile(source.Path)
 		if readErr != nil {
 			return fmt.Errorf("unable to read log %s: %w", source.Path, readErr)
 		}
@@ -405,6 +407,23 @@ func parseWindow(sinceRaw, untilRaw string) (time.Time, time.Time, error) {
 	}
 
 	return since.UTC(), until.UTC(), nil
+}
+
+func readLogFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if strings.HasSuffix(path, ".gz") {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, err
+		}
+		defer gr.Close()
+		return io.ReadAll(gr)
+	}
+	return io.ReadAll(f)
 }
 
 func filterWindow(events []model.Event, since, until time.Time) []model.Event {

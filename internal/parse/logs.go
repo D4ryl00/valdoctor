@@ -402,7 +402,9 @@ func toInt64(value any) (int64, bool) {
 }
 
 func DefaultNodeName(path string, used map[string]int) string {
-	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	base := filepath.Base(path)
+	base = strings.TrimSuffix(base, ".gz")
+	base = strings.TrimSuffix(base, filepath.Ext(base))
 	base = strings.ReplaceAll(base, " ", "_")
 	base = strings.ReplaceAll(base, "-", "_")
 	if base == "" {
