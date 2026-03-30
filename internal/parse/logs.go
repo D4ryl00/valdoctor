@@ -103,14 +103,18 @@ func parseJSONLine(source model.Source, clean string, lineNo int) (model.Event, 
 		return event, fmt.Sprintf("%s:%d: invalid json log line: %v", source.Path, lineNo, err)
 	}
 
-	// Unwrap Docker/container log format: {"log":"{inner JSON}\n","stream":"...","time":"..."}
+	// Unwrap Docker/container log format: {"log":"...\n","stream":"...","time":"..."}
 	if logField, ok := payload["log"].(string); ok {
 		inner := strings.TrimSpace(logField)
 		if strings.HasPrefix(inner, "{") {
+			// Inner payload is also JSON — unwrap and continue.
 			var innerPayload map[string]any
 			if err := json.Unmarshal([]byte(inner), &innerPayload); err == nil {
 				payload = innerPayload
 			}
+		} else if looksLikeTimestamp(inner) {
+			// Inner payload is a console-format line — delegate entirely.
+			return parseConsoleLine(source, inner, lineNo)
 		}
 	}
 
