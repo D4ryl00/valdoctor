@@ -216,6 +216,38 @@ func Text(report model.Report, opts TextOptions) string {
 			if node.ProposalSignedCount > 0 {
 				fmt.Fprintf(&b, "  proposals signed: %d\n", node.ProposalSignedCount)
 			}
+			// Show peer gossip states when they differ from the local commit height,
+			// indicating what remote peers were doing at the time of any stall.
+			if len(node.PeerStates) > 0 {
+				peersAhead := 0
+				for _, ps := range node.PeerStates {
+					if ps.Height > node.HighestCommit {
+						peersAhead++
+					}
+				}
+				if peersAhead > 0 || node.PeerVoteMaxHeight > node.HighestCommit {
+					fmt.Fprintf(&b, "  %s\n", c.dim("peer gossip (last known state):"))
+					for _, ps := range node.PeerStates {
+						lag := ""
+						if ps.Height < node.LastHeight {
+							lag = c.red(fmt.Sprintf(" [%d behind]", node.LastHeight-ps.Height))
+						}
+						fmt.Fprintf(&b, "  %s height=%d round=%d step=%s%s\n",
+							c.gray(ps.Peer), ps.Height, ps.Round, ps.Step, lag)
+					}
+				}
+				if node.PeerVoteMaxHeight > 0 {
+					voteNote := fmt.Sprintf("  last vote gossip received at h%d", node.PeerVoteMaxHeight)
+					// Only flag a chain-wide halt when there is a real stall — i.e.
+					// the log window extends well past the last commit. Use the same
+					// 30s floor as the stall-finding threshold so a log that ends
+					// a few ms after the last commit never triggers this annotation.
+					if node.PeerVoteMaxHeight <= node.HighestCommit && node.StallDuration >= 30*time.Second {
+						voteNote += c.red(" (zero votes for next height — chain-wide halt)")
+					}
+					fmt.Fprintf(&b, "%s\n", c.dim(voteNote))
+				}
+			}
 		}
 	}
 

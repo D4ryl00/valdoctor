@@ -9,6 +9,17 @@ import (
 	"github.com/D4ryl00/valdoctor/internal/model"
 )
 
+// NodePeerStats carries peer-gossip data extracted by the parser for a single node.
+type NodePeerStats struct {
+	// MaxVoteHeight is the highest block height for which any vote was received
+	// from a peer. Equal to the node's highest commit during a stall means all
+	// validators stopped voting simultaneously (chain-wide halt).
+	MaxVoteHeight int64
+	// RoundStates maps each peer's p2p address (g1xxx…) to its last-known
+	// consensus round state, inferred from [NewRoundStep …] gossip messages.
+	RoundStates map[string]model.PeerRoundState
+}
+
 type Input struct {
 	Genesis             model.Genesis
 	Sources             []model.Source
@@ -17,10 +28,11 @@ type Input struct {
 	UnclassifiedCounts  map[string]model.UnclassifiedEntry
 	Verbose             bool
 	Metadata            model.Metadata // optional; zero value means not provided
+	PeerStatsByNode     map[string]NodePeerStats
 }
 
 func BuildReport(input Input) model.Report {
-	nodes := buildNodeSummaries(input.Sources, input.Events)
+	nodes := buildNodeSummaries(input.Sources, input.Events, input.PeerStatsByNode)
 	findings := buildFindings(input.Genesis, nodes, input.Events, input.Warnings, input.Metadata)
 
 	start, end := timeBounds(input.Events)
@@ -92,7 +104,7 @@ func BuildReport(input Input) model.Report {
 	return report
 }
 
-func buildNodeSummaries(sources []model.Source, events []model.Event) []model.NodeSummary {
+func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsByNode map[string]NodePeerStats) []model.NodeSummary {
 	summaries := map[string]*model.NodeSummary{}
 	firstCommitByNode := map[string]time.Time{}
 	// Per-node: height → max round seen at that height.
@@ -240,6 +252,32 @@ func buildNodeSummaries(sources []model.Source, events []model.Event) []model.No
 					summary.MaxRoundHeight = h
 				}
 			}
+		}
+		summaries[name] = summary
+	}
+
+	// Third pass: attach peer gossip stats collected during parsing.
+	for name, ps := range peerStatsByNode {
+		summary, ok := summaries[name]
+		if !ok {
+			continue
+		}
+		summary.PeerVoteMaxHeight = ps.MaxVoteHeight
+		if len(ps.RoundStates) > 0 {
+			states := make([]model.PeerRoundState, 0, len(ps.RoundStates))
+			for _, rs := range ps.RoundStates {
+				states = append(states, rs)
+			}
+			sort.Slice(states, func(i, j int) bool {
+				if states[i].Height != states[j].Height {
+					return states[i].Height > states[j].Height
+				}
+				if states[i].Round != states[j].Round {
+					return states[i].Round > states[j].Round
+				}
+				return states[i].Peer < states[j].Peer
+			})
+			summary.PeerStates = states
 		}
 		summaries[name] = summary
 	}
@@ -1116,6 +1154,16 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			possibleCauses = append(possibleCauses,
 				"remote signer was unavailable throughout the stall window — this node could not sign proposals or votes")
 		}
+		// Chain-wide halt: check whether any peer gossip votes were received for
+		// the stall height. If the max vote height equals the last commit height,
+		// no validator voted for the next block at all — the whole network stopped.
+		if node.PeerVoteMaxHeight > 0 && node.PeerVoteMaxHeight < nextH {
+			possibleCauses = append(possibleCauses,
+				fmt.Sprintf("chain-wide halt: zero votes received from any peer for h%d — "+
+					"all validators appear to have stopped participating simultaneously (last vote gossip was at h%d)",
+					nextH, node.PeerVoteMaxHeight))
+		}
+
 		if len(possibleCauses) == 0 {
 			// No specific cause detectable from available events.
 			if node.HasDebugLogs {

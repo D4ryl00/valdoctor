@@ -28,15 +28,37 @@ var (
 	// timestampRE matches ISO 8601 timestamps so they are collapsed before hex/digit rules run.
 	timestampRE       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z`)
 	whitespaceRE      = regexp.MustCompile(`\s+`)
+
+	// Regexes for extracting peer gossip state (vote messages and round-step updates).
+	// peerVoteRE extracts block height from [Vote Vote{VI:ADDR HEIGHT/ROUND/TYPE ...}].
+	peerVoteRE = regexp.MustCompile(`\[Vote Vote\{\d+:[0-9A-Fa-f]+ (\d+)/`)
+	// peerNRSRE extracts height, round, step from [NewRoundStep H:X R:Y S:Z ...].
+	peerNRSRE  = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
+	// peerAddrRE extracts the bech32 peer address from "Peer{MConn{...} g1xxx in/out}".
+	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
 )
 
-func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, map[string]model.UnclassifiedEntry, error) {
+// ParseStats holds aggregated peer-gossip data extracted during parsing.
+// Vote and round-step messages are far too numerous to store individually;
+// only summaries are tracked.
+type ParseStats struct {
+	// MaxPeerVoteHeight is the highest block height for which any vote was
+	// received from a peer.  If this equals the node's last commit height at
+	// the end of a stall, no validator cast any votes after that block.
+	MaxPeerVoteHeight int64
+	// PeerRoundStates maps each peer's p2p address (g1xxx…) to its last-known
+	// consensus state, inferred from received [NewRoundStep …] gossip messages.
+	PeerRoundStates map[string]model.PeerRoundState
+}
+
+func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, map[string]model.UnclassifiedEntry, ParseStats, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	events := make([]model.Event, 0)
 	warnings := make([]string, 0)
 	unclassified := map[string]model.UnclassifiedEntry{}
+	stats := ParseStats{PeerRoundStates: map[string]model.PeerRoundState{}}
 	lineNo := 0
 
 	for scanner.Scan() {
@@ -62,12 +84,64 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, ma
 			}
 		}
 		if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
+			if event.Kind == model.EventKnownNoise {
+				collectPeerGossip(event, &stats)
+			}
 			continue
 		}
 		events = append(events, event)
 	}
 
-	return events, warnings, unclassified, scanner.Err()
+	return events, warnings, unclassified, stats, scanner.Err()
+}
+
+// collectPeerGossip extracts peer consensus state from p2p gossip messages that
+// are otherwise dropped as known noise. Only [Vote ...] and [NewRoundStep ...]
+// messages are inspected; everything else is skipped immediately.
+func collectPeerGossip(event model.Event, stats *ParseStats) {
+	msg := event.Message
+	if strings.HasPrefix(msg, "[Vote ") {
+		if m := peerVoteRE.FindStringSubmatch(msg); m != nil {
+			if h, err := strconv.ParseInt(m[1], 10, 64); err == nil && h > stats.MaxPeerVoteHeight {
+				stats.MaxPeerVoteHeight = h
+			}
+		}
+		return
+	}
+	if strings.HasPrefix(msg, "[NewRoundStep ") {
+		m := peerNRSRE.FindStringSubmatch(msg)
+		if m == nil {
+			return
+		}
+		h, _ := strconv.ParseInt(m[1], 10, 64)
+		r, _ := strconv.Atoi(m[2])
+		step := m[3]
+		peer := extractPeerAddr(event.Fields)
+		if peer == "" || h == 0 {
+			return
+		}
+		existing, ok := stats.PeerRoundStates[peer]
+		if !ok || h > existing.Height || (h == existing.Height && r > existing.Round) {
+			stats.PeerRoundStates[peer] = model.PeerRoundState{Peer: peer, Height: h, Round: r, Step: step}
+		}
+	}
+}
+
+// extractPeerAddr pulls the bech32 peer address (g1xxx…) from the "src" field
+// that TM2 attaches to Receive/Send log entries.
+// The field value looks like: "Peer{MConn{IP:PORT} g1xxx... in}" or similar.
+func extractPeerAddr(fields map[string]any) string {
+	if fields == nil {
+		return ""
+	}
+	src, _ := fields["src"].(string)
+	if src == "" {
+		return ""
+	}
+	if m := peerAddrRE.FindStringSubmatch(src); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, string) {

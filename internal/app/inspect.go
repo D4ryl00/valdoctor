@@ -148,13 +148,14 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 	events := make([]model.Event, 0)
 	warnings := append([]string(nil), metadataWarnings...)
 	unclassified := map[string]model.UnclassifiedEntry{}
+	peerStatsByNode := map[string]parse.ParseStats{}
 
 	for _, source := range sources {
 		rc, openErr := openLogFile(source.Path)
 		if openErr != nil {
 			return fmt.Errorf("unable to open log %s: %w", source.Path, openErr)
 		}
-		fileEvents, fileWarnings, fileUnclassified, parseErr := parse.ParseLogFile(source, rc)
+		fileEvents, fileWarnings, fileUnclassified, fileStats, parseErr := parse.ParseLogFile(source, rc)
 		rc.Close()
 		if parseErr != nil {
 			return fmt.Errorf("error reading log %s: %w", source.Path, parseErr)
@@ -171,6 +172,22 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 			}
 			unclassified[msg] = agg
 		}
+		// Merge peer stats per node (last-wins for individual peer states since
+		// they are already kept at max height during parsing).
+		existing := peerStatsByNode[source.Node]
+		if fileStats.MaxPeerVoteHeight > existing.MaxPeerVoteHeight {
+			existing.MaxPeerVoteHeight = fileStats.MaxPeerVoteHeight
+		}
+		if existing.PeerRoundStates == nil {
+			existing.PeerRoundStates = map[string]model.PeerRoundState{}
+		}
+		for addr, rs := range fileStats.PeerRoundStates {
+			prev, ok := existing.PeerRoundStates[addr]
+			if !ok || rs.Height > prev.Height || (rs.Height == prev.Height && rs.Round > prev.Round) {
+				existing.PeerRoundStates[addr] = rs
+			}
+		}
+		peerStatsByNode[source.Node] = existing
 	}
 
 	sort.SliceStable(events, func(i, j int) bool {
@@ -192,6 +209,15 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		return events[i].Path < events[j].Path
 	})
 
+	// Convert parse.ParseStats → analyze.NodePeerStats for each node.
+	analyzePeerStats := map[string]analyze.NodePeerStats{}
+	for node, ps := range peerStatsByNode {
+		analyzePeerStats[node] = analyze.NodePeerStats{
+			MaxVoteHeight: ps.MaxPeerVoteHeight,
+			RoundStates:   ps.PeerRoundStates,
+		}
+	}
+
 	report := analyze.BuildReport(analyze.Input{
 		Genesis:            genesis,
 		Sources:            sources,
@@ -200,6 +226,7 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		UnclassifiedCounts: unclassified,
 		Verbose:            cfg.verbose,
 		Metadata:           metadata,
+		PeerStatsByNode:    analyzePeerStats,
 	})
 
 	var generationErr error

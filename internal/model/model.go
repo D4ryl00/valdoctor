@@ -168,6 +168,15 @@ type Finding struct {
 	SuggestedActions []string   `json:"suggested_actions,omitempty"`
 }
 
+// PeerRoundState is the last-known consensus state of a remote peer,
+// inferred from [NewRoundStep ...] gossip messages in this node's log.
+type PeerRoundState struct {
+	Peer   string `json:"peer"`
+	Height int64  `json:"height"`
+	Round  int    `json:"round"`
+	Step   string `json:"step"`
+}
+
 type NodeSummary struct {
 	Name           string     `json:"name"`
 	Role           Role       `json:"role"`
@@ -182,6 +191,12 @@ type NodeSummary struct {
 	MaxPeers       int        `json:"max_peers"`
 	CurrentPeers   int        `json:"current_peers"`
 	ParserWarnings int        `json:"parser_warnings"`
+
+	// Peer consensus state inferred from received gossip.
+	// PeerVoteMaxHeight is the highest block height for which any vote was received via p2p.
+	// If PeerVoteMaxHeight == HighestCommit during a stall, no validator cast votes for the next height.
+	PeerVoteMaxHeight int64            `json:"peer_vote_max_height,omitempty"`
+	PeerStates        []PeerRoundState `json:"peer_states,omitempty"`
 
 	// Last known consensus state (updated per consensus event with Height > 0).
 	LastHeight    int64     `json:"last_height,omitempty"`
