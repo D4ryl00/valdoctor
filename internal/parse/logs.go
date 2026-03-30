@@ -81,6 +81,17 @@ func parseJSONLine(source model.Source, raw, clean string, lineNo int) (model.Ev
 		return event, fmt.Sprintf("%s:%d: invalid json log line: %v", source.Path, lineNo, err)
 	}
 
+	// Unwrap Docker/container log format: {"log":"{inner JSON}\n","stream":"...","time":"..."}
+	if logField, ok := payload["log"].(string); ok {
+		inner := strings.TrimSpace(logField)
+		if strings.HasPrefix(inner, "{") {
+			var innerPayload map[string]any
+			if err := json.Unmarshal([]byte(inner), &innerPayload); err == nil {
+				payload = innerPayload
+			}
+		}
+	}
+
 	if ts, ok := payload["ts"].(float64); ok {
 		sec := int64(ts)
 		nsec := int64((ts - float64(sec)) * float64(time.Second))
