@@ -424,17 +424,20 @@ func openLogFile(path string) (io.ReadCloser, error) {
 			f.Close()
 			return nil, err
 		}
-		return struct {
-			io.Reader
-			io.Closer
-		}{gr, closerFunc(func() error { gr.Close(); return f.Close() })}, nil
+		return &gzipReadCloser{Reader: gr, f: f}, nil
 	}
 	return f, nil
 }
 
-type closerFunc func() error
+type gzipReadCloser struct {
+	*gzip.Reader
+	f *os.File
+}
 
-func (c closerFunc) Close() error { return c() }
+func (g *gzipReadCloser) Close() error {
+	g.Reader.Close()
+	return g.f.Close()
+}
 
 func filterWindow(events []model.Event, since, until time.Time) []model.Event {
 	if since.IsZero() && until.IsZero() {
