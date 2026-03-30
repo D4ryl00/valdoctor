@@ -117,7 +117,6 @@ type Event struct {
 	Kind         EventKind      `json:"kind"`
 	Height       int64          `json:"height,omitempty"`
 	Round        int            `json:"round,omitempty"`
-	Raw          string         `json:"raw"`
 }
 
 type Severity string

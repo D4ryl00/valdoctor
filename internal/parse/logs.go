@@ -39,7 +39,7 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, er
 		if warning != "" {
 			warnings = append(warnings, warning)
 		}
-		if event.Raw == "" {
+		if event.Kind == model.EventUnknown {
 			continue
 		}
 		events = append(events, event)
@@ -54,11 +54,11 @@ func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, str
 
 	switch {
 	case strings.HasPrefix(strings.TrimSpace(clean), "{"):
-		return parseJSONLine(source, raw, clean, lineNo)
+		return parseJSONLine(source, clean, lineNo)
 	case looksLikeTimestamp(clean):
-		return parseConsoleLine(source, raw, clean, lineNo)
+		return parseConsoleLine(source, clean, lineNo)
 	default:
-		event := baseEvent(source, raw, lineNo)
+		event := baseEvent(source, lineNo)
 		event.Format = "raw"
 		event.Message = strings.TrimSpace(clean)
 		event.Kind = classifyMessage(event.Message)
@@ -70,8 +70,8 @@ func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, str
 	}
 }
 
-func parseJSONLine(source model.Source, raw, clean string, lineNo int) (model.Event, string) {
-	event := baseEvent(source, raw, lineNo)
+func parseJSONLine(source model.Source, clean string, lineNo int) (model.Event, string) {
+	event := baseEvent(source, lineNo)
 	event.Format = "json"
 
 	var payload map[string]any
@@ -118,8 +118,8 @@ func parseJSONLine(source model.Source, raw, clean string, lineNo int) (model.Ev
 	return event, ""
 }
 
-func parseConsoleLine(source model.Source, raw, clean string, lineNo int) (model.Event, string) {
-	event := baseEvent(source, raw, lineNo)
+func parseConsoleLine(source model.Source, clean string, lineNo int) (model.Event, string) {
+	event := baseEvent(source, lineNo)
 	event.Format = "console"
 
 	tsToken, rest, ok := cutToken(clean)
@@ -158,15 +158,13 @@ func parseConsoleLine(source model.Source, raw, clean string, lineNo int) (model
 	return event, ""
 }
 
-func baseEvent(source model.Source, raw string, lineNo int) model.Event {
+func baseEvent(source model.Source, lineNo int) model.Event {
 	return model.Event{
-		Node:   source.Node,
-		Role:   source.Role,
-		Path:   source.Path,
-		Line:   lineNo,
-		Raw:    raw,
-		Fields: map[string]any{},
-		Kind:   model.EventUnknown,
+		Node: source.Node,
+		Role: source.Role,
+		Path: source.Path,
+		Line: lineNo,
+		Kind: model.EventUnknown,
 	}
 }
 
@@ -309,10 +307,6 @@ func classifyMessage(msg string) model.EventKind {
 }
 
 func enrichEvent(event *model.Event) {
-	if event.Fields == nil {
-		event.Fields = map[string]any{}
-	}
-
 	if event.Height == 0 {
 		event.Height = extractHeight(event.Message, event.Fields)
 	}
