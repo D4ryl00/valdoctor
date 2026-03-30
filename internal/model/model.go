@@ -94,13 +94,24 @@ const (
 	EventRemoteSignerFailure  EventKind = "remote_signer_failure"
 	EventRemoteSignerConnect  EventKind = "remote_signer_connected"
 	EventReceivedCompletePart EventKind = "received_complete_proposal_block"
-	EventFastSyncBlockError   EventKind = "fastsync_block_validation_error"
-	EventAddedPrevote         EventKind = "added_prevote"
-	EventAddedPrecommit       EventKind = "added_precommit"
-	EventCommitUnknownBlock   EventKind = "commit_unknown_block"
-	EventCommitLockedBlock    EventKind = "commit_locked_block"
-	EventUnexpectedBlockPart  EventKind = "unexpected_block_part"
-	EventAddVoteError         EventKind = "add_vote_error"
+	EventFastSyncBlockError      EventKind = "fastsync_block_validation_error"
+	EventAddedPrevote            EventKind = "added_prevote"
+	EventAddedPrecommit          EventKind = "added_precommit"
+	EventCommitUnknownBlock      EventKind = "commit_unknown_block"
+	EventCommitLockedBlock       EventKind = "commit_locked_block"
+	EventUnexpectedBlockPart     EventKind = "unexpected_block_part"
+	EventAddVoteError            EventKind = "add_vote_error"
+	EventCommittedState          EventKind = "committed_state"
+	EventExecutedBlock           EventKind = "executed_block"
+	EventCommitSynced            EventKind = "commit_synced"
+	EventFastSyncRate            EventKind = "fast_sync_rate"
+	EventNodeIsValidator         EventKind = "node_is_validator"
+	EventRemoteSignerSuccess     EventKind = "remote_signer_success"
+	EventPrevoteProposalInvalid  EventKind = "prevote_proposal_invalid"
+	// EventKnownNoise marks messages that are recognised from the gno source
+	// but carry no diagnostic value. They are dropped immediately — not stored
+	// and not counted in the unclassified frequency table.
+	EventKnownNoise              EventKind = "known_noise"
 )
 
 type Event struct {
@@ -215,6 +226,13 @@ type NodeSummary struct {
 	HasDebugLogs bool `json:"has_debug_logs,omitempty"`
 }
 
+type UnclassifiedEntry struct {
+	Message   string `json:"message"`
+	Count     int    `json:"count"`
+	FirstPath string `json:"first_path"`
+	FirstLine int    `json:"first_line"`
+}
+
 type InputSummary struct {
 	GenesisPath     string `json:"genesis_path"`
 	ChainID         string `json:"chain_id"`
@@ -227,11 +245,12 @@ type InputSummary struct {
 }
 
 type Report struct {
-	Input                  InputSummary  `json:"input"`
-	Nodes                  []NodeSummary `json:"nodes"`
-	Findings               []Finding     `json:"findings"`
-	Warnings               []string      `json:"warnings,omitempty"`
-	MetadataGeneratedPath  string        `json:"metadata_generated_path,omitempty"`
-	ConfidenceTooLow       bool          `json:"confidence_too_low"`
-	CriticalIssuesDetected bool          `json:"critical_issues_detected"`
+	Input                  InputSummary       `json:"input"`
+	Nodes                  []NodeSummary      `json:"nodes"`
+	Findings               []Finding          `json:"findings"`
+	Warnings               []string           `json:"warnings,omitempty"`
+	UnclassifiedCounts     []UnclassifiedEntry `json:"unclassified_counts,omitempty"`
+	MetadataGeneratedPath  string             `json:"metadata_generated_path,omitempty"`
+	ConfidenceTooLow       bool               `json:"confidence_too_low"`
+	CriticalIssuesDetected bool               `json:"critical_issues_detected"`
 }

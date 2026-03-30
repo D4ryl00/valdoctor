@@ -257,11 +257,24 @@ func Text(report model.Report, opts TextOptions) string {
 	}
 
 	// ── Unclassified log lines ────────────────────────────────────────────────
-	if opts.ShowUnclassified && len(report.Warnings) > 0 {
-		b.WriteString("\n" + c.bold("Unclassified log lines") + "\n")
-		for _, warning := range report.Warnings {
-			fmt.Fprintf(&b, "- %s\n", warning)
+	if opts.ShowUnclassified && len(report.UnclassifiedCounts) > 0 {
+		total := 0
+		for _, e := range report.UnclassifiedCounts {
+			total += e.Count
 		}
+		fmt.Fprintf(&b, "\n%s (%s total)\n", c.bold("Unclassified log lines"), formatCount(total))
+		maxCount := report.UnclassifiedCounts[0].Count
+		countWidth := len(fmt.Sprintf("%d", maxCount))
+		idxWidth := len(fmt.Sprintf("%d", len(report.UnclassifiedCounts)))
+		for i, e := range report.UnclassifiedCounts {
+			fmt.Fprintf(&b, "  %*d. %*d  %-60s (first: %s:%d)\n",
+				idxWidth, i+1,
+				countWidth, e.Count,
+				truncate(e.Message, 60),
+				e.FirstPath, e.FirstLine,
+			)
+		}
+		fmt.Fprintf(&b, "\n  %s\n", c.dim("tip: use -category N to browse all lines in a category"))
 	}
 
 	return strings.TrimRight(b.String(), "\n") + "\n"
@@ -285,4 +298,21 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+func formatCount(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1_000_000 {
+		return fmt.Sprintf("%d,%03d", n/1000, n%1000)
+	}
+	return fmt.Sprintf("%d,%03d,%03d", n/1_000_000, (n/1000)%1000, n%1000)
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ type inspectCfg struct {
 	showUnclassified bool
 	maxFindings      int
 	maxHealth        int
+	categoryN        int
 }
 
 type multiString []string
@@ -82,6 +84,7 @@ func (c *inspectCfg) RegisterFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.showUnclassified, "show-unclassified", false, "print unclassified log lines at the end of the report")
 	fs.IntVar(&c.maxFindings, "max-findings", 0, "maximum number of findings rendered in text output (default: 20)")
 	fs.IntVar(&c.maxHealth, "max-health", 0, "maximum number of nodes shown in health summary (default: 5; 0 in verbose)")
+	fs.IntVar(&c.categoryN, "category", 0, "browse all log lines for unclassified category N (from -show-unclassified table)")
 }
 
 func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
@@ -144,19 +147,30 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 
 	events := make([]model.Event, 0)
 	warnings := append([]string(nil), metadataWarnings...)
+	unclassified := map[string]model.UnclassifiedEntry{}
 
 	for _, source := range sources {
 		rc, openErr := openLogFile(source.Path)
 		if openErr != nil {
 			return fmt.Errorf("unable to open log %s: %w", source.Path, openErr)
 		}
-		fileEvents, fileWarnings, parseErr := parse.ParseLogFile(source, rc)
+		fileEvents, fileWarnings, fileUnclassified, parseErr := parse.ParseLogFile(source, rc)
 		rc.Close()
 		if parseErr != nil {
 			return fmt.Errorf("error reading log %s: %w", source.Path, parseErr)
 		}
 		events = append(events, filterWindow(fileEvents, since, until)...)
 		warnings = append(warnings, fileWarnings...)
+		for msg, entry := range fileUnclassified {
+			agg := unclassified[msg]
+			agg.Count += entry.Count
+			if agg.Count == entry.Count {
+				agg.Message = entry.Message
+				agg.FirstPath = entry.FirstPath
+				agg.FirstLine = entry.FirstLine
+			}
+			unclassified[msg] = agg
+		}
 	}
 
 	sort.SliceStable(events, func(i, j int) bool {
@@ -179,12 +193,13 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 	})
 
 	report := analyze.BuildReport(analyze.Input{
-		Genesis:  genesis,
-		Sources:  sources,
-		Events:   events,
-		Warnings: warnings,
-		Verbose:  cfg.verbose,
-		Metadata: metadata,
+		Genesis:            genesis,
+		Sources:            sources,
+		Events:             events,
+		Warnings:           warnings,
+		UnclassifiedCounts: unclassified,
+		Verbose:            cfg.verbose,
+		Metadata:           metadata,
 	})
 
 	var generationErr error
@@ -202,6 +217,31 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		}
 	}
 	report.Warnings = append([]string(nil), warnings...)
+
+	// ── Category browser ────────────────────────────────────────────────────
+	if cfg.categoryN > 0 {
+		counts := report.UnclassifiedCounts
+		if cfg.categoryN > len(counts) {
+			return fmt.Errorf("category %d out of range (1-%d)", cfg.categoryN, len(counts))
+		}
+		targetKey := counts[cfg.categoryN-1].Message
+
+		w, closeW := openPager()
+		defer closeW()
+
+		for _, source := range sources {
+			rc, openErr := openLogFile(source.Path)
+			if openErr != nil {
+				return fmt.Errorf("unable to open log %s: %w", source.Path, openErr)
+			}
+			streamErr := parse.StreamCategoryLines(source, rc, targetKey, w)
+			rc.Close()
+			if streamErr != nil {
+				return fmt.Errorf("error reading log %s: %w", source.Path, streamErr)
+			}
+		}
+		return nil
+	}
 
 	// Enable colors only when stdout is a real terminal and NO_COLOR is unset.
 	colorOutput := term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
@@ -437,6 +477,36 @@ type gzipReadCloser struct {
 func (g *gzipReadCloser) Close() error {
 	g.Reader.Close()
 	return g.f.Close()
+}
+
+// openPager returns a writer and a closer. When stdout is a terminal it
+// spawns $PAGER (default: less) and pipes output through it; otherwise it
+// writes directly to stdout.
+func openPager() (io.Writer, func()) {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return os.Stdout, func() {}
+	}
+	pager := os.Getenv("PAGER")
+	if pager == "" {
+		pager = "less"
+	}
+	if _, err := exec.LookPath(pager); err != nil {
+		return os.Stdout, func() {}
+	}
+	pr, pw := io.Pipe()
+	cmd := exec.Command(pager)
+	cmd.Stdin = pr
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return os.Stdout, func() {}
+	}
+	return pw, func() {
+		pw.Close()
+		cmd.Wait()
+	}
 }
 
 func filterWindow(events []model.Event, since, until time.Time) []model.Event {

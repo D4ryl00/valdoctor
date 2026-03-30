@@ -19,14 +19,24 @@ var (
 	ansiRE            = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	heightRoundRE     = regexp.MustCompile(`\((\d+)\/(-?\d+)\)`)
 	voteSetRE         = regexp.MustCompile(`\+2/3:([^(]+)\([^)]+\) BA\{(\d+):([x_]+)\}`)
+	digitSeqRE        = regexp.MustCompile(`\d+`)
+	// hexSeqRE matches hex strings that contain at least one letter (a-f/A-F),
+	// ensuring pure digit sequences always fall through to digitSeqRE instead.
+	// The alternation covers letter-first and letter-last with 8+ total chars.
+	hexSeqRE          = regexp.MustCompile(`[0-9A-Fa-f]*[A-Fa-f][0-9A-Fa-f]{7,}|[0-9A-Fa-f]{7,}[A-Fa-f][0-9A-Fa-f]*`)
+	bitArrayRE        = regexp.MustCompile(`BA\{[^}]*\}`)
+	// timestampRE matches ISO 8601 timestamps so they are collapsed before hex/digit rules run.
+	timestampRE       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z`)
+	whitespaceRE      = regexp.MustCompile(`\s+`)
 )
 
-func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, error) {
+func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, map[string]model.UnclassifiedEntry, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	events := make([]model.Event, 0)
 	warnings := make([]string, 0)
+	unclassified := map[string]model.UnclassifiedEntry{}
 	lineNo := 0
 
 	for scanner.Scan() {
@@ -37,15 +47,27 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, er
 		}
 		event, warning := ParseLogLine(source, raw, lineNo)
 		if warning != "" {
-			warnings = append(warnings, warning)
+			if event.Kind == model.EventUnknown {
+				key := NormalizeMessage(event.Message)
+				entry := unclassified[key]
+				entry.Count++
+				if entry.Count == 1 {
+					entry.Message = key
+					entry.FirstPath = source.Path
+					entry.FirstLine = lineNo
+				}
+				unclassified[key] = entry
+			} else {
+				warnings = append(warnings, warning)
+			}
 		}
-		if event.Kind == model.EventUnknown {
+		if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
 			continue
 		}
 		events = append(events, event)
 	}
 
-	return events, warnings, scanner.Err()
+	return events, warnings, unclassified, scanner.Err()
 }
 
 func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, string) {
@@ -233,41 +255,35 @@ func classifyMessage(msg string) model.EventKind {
 	case msg == "":
 		return model.EventUnknown
 
-	// Startup / configuration
+	// ── Startup / configuration ────────────────────────────────────────────
 	case strings.Contains(msg, "unable to update config field"):
 		return model.EventConfigError
 
-	// Fast-sync
+	// ── Fast-sync (blockchain reactor) ────────────────────────────────────
 	case strings.Contains(msg, "SwitchToConsensus"):
+		return model.EventSwitchToConsensus
+	case strings.Contains(msg, "Time to switch to consensus reactor!"):
 		return model.EventSwitchToConsensus
 	case strings.Contains(msg, "BlockchainReactor validation error"):
 		return model.EventFastSyncBlockError
+	case strings.Contains(msg, "Fast Sync Rate"):
+		return model.EventFastSyncRate
 
-	// P2P
+	// ── P2P connectivity ───────────────────────────────────────────────────
 	case strings.Contains(msg, "Added peer"):
 		return model.EventAddedPeer
 	case strings.Contains(msg, "Stopping peer for error"):
 		return model.EventStoppedPeer
 	case strings.Contains(msg, "unable to dial peer"):
 		return model.EventDialFailure
+	case strings.Contains(msg, "Failed to dial"):
+		return model.EventDialFailure
 	case strings.Contains(msg, "ignoring dial request: already have max outbound peers"):
 		return model.EventMaxOutboundPeers
 	case strings.Contains(msg, "no peers to share in discovery request"):
 		return model.EventNoPeersToShare
 
-	// Consensus — check specific sub-messages before generic ones
-	case strings.Contains(msg, "Added to prevote"):
-		return model.EventAddedPrevote
-	case strings.Contains(msg, "Added to precommit"):
-		return model.EventAddedPrecommit
-	case strings.Contains(msg, "Commit is for a block we don't know about"):
-		return model.EventCommitUnknownBlock
-	case strings.Contains(msg, "Commit is for locked block"):
-		return model.EventCommitLockedBlock
-	case strings.Contains(msg, "Received a block part when we're not expecting any"):
-		return model.EventUnexpectedBlockPart
-	case strings.Contains(msg, "Error attempting to add vote"):
-		return model.EventAddVoteError
+	// ── Consensus — errors and anomalies (specific before generic) ─────────
 	case strings.Contains(msg, "CONSENSUS FAILURE!!!"):
 		return model.EventConsensusFailure
 	case strings.Contains(msg, "Found conflicting vote from ourselves"):
@@ -276,30 +292,256 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventApplyBlockError
 	case strings.Contains(msg, "enterPrevote: ProposalBlock is nil"):
 		return model.EventPrevoteProposalNil
+	case strings.Contains(msg, "enterPrevote: ProposalBlock is invalid"):
+		return model.EventPrevoteProposalInvalid
 	case strings.Contains(msg, "enterPrecommit: No +2/3 prevotes during enterPrecommit"):
 		return model.EventPrecommitNoMaj23
 	case strings.Contains(msg, "Attempt to finalize failed. There was no +2/3 majority"):
 		return model.EventFinalizeNoMaj23
 	case strings.Contains(msg, "Attempt to finalize failed. We don't have the commit block."):
 		return model.EventCommitBlockMissing
+	case strings.Contains(msg, "Commit is for a block we don't know about"):
+		return model.EventCommitUnknownBlock
+	case strings.Contains(msg, "Received a block part when we're not expecting any"):
+		return model.EventUnexpectedBlockPart
+	case strings.Contains(msg, "Error attempting to add vote"):
+		return model.EventAddVoteError
+
+	// ── Consensus — meaningful progress events ─────────────────────────────
 	case strings.Contains(msg, "Finalizing commit of block"):
 		return model.EventFinalizeCommit
 	case strings.Contains(msg, "Timed out"):
 		return model.EventTimeout
+	case strings.Contains(msg, "Added to prevote"):
+		return model.EventAddedPrevote
+	case strings.Contains(msg, "Added to precommit"):
+		return model.EventAddedPrecommit
+	case strings.Contains(msg, "Commit is for locked block"):
+		return model.EventCommitLockedBlock
 	case strings.Contains(msg, "Received complete proposal block"):
 		return model.EventReceivedCompletePart
 	case strings.Contains(msg, "Signed proposal"):
 		return model.EventSignedProposal
 
-	// Validator identity
+	// ── Execution / application layer ─────────────────────────────────────
+	// Source: tm2/pkg/bft/state/execution.go, tm2/pkg/sdk/baseapp.go
+	case strings.Contains(msg, "Committed state"):
+		return model.EventCommittedState
+	case strings.Contains(msg, "Executed block"):
+		return model.EventExecutedBlock
+	case strings.Contains(msg, "Commit synced"):
+		return model.EventCommitSynced
+
+	// ── Validator identity ─────────────────────────────────────────────────
 	case strings.Contains(msg, "This node is not a validator"):
 		return model.EventNodeNotValidator
+	case strings.Contains(msg, "This node is a validator"):
+		return model.EventNodeIsValidator
 
-	// Remote signer
+	// ── Remote signer ─────────────────────────────────────────────────────
 	case strings.Contains(msg, "Sign request failed"):
 		return model.EventRemoteSignerFailure
 	case strings.Contains(msg, "Connected to server"):
 		return model.EventRemoteSignerConnect
+	case strings.Contains(msg, "Sign request succeeded"):
+		return model.EventRemoteSignerSuccess
+
+	// ── Known noise — consensus state machine transitions ──────────────────
+	// Source: tm2/pkg/bft/consensus/state.go — normal round-robin transitions.
+	case strings.Contains(msg, "enterNewRound("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPropose("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPropose: Not our turn to propose"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPrevote: ProposalBlock is valid"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPrevote("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPrevoteWait("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPrecommit("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterPrecommitWait("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "enterCommit("):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Resetting Proposal info"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Scheduled timeout"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Ignoring tock"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Received proposal"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Received tick"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Received tock"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Timer already stopped"):
+		return model.EventKnownNoise
+
+	// ── Known noise — voting bookkeeping ──────────────────────────────────
+	// Source: tm2/pkg/bft/consensus/state.go, reactor.go
+	case strings.Contains(msg, "Added to lastPrecommits:"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "setHasVote"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "addVote"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Signed and pushed vote"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "No votes to send"):
+		return model.EventKnownNoise
+
+	// ── Known noise — consensus reactor gossip ────────────────────────────
+	// Source: tm2/pkg/bft/consensus/reactor.go
+	case strings.Contains(msg, "Sending proposal"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Sending block part"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Sending vote message"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Picked rs.LastCommit to send"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Picked rs.Prevotes"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Picked rs.Precommits"):
+		return model.EventKnownNoise
+
+	// ── Known noise — P2P message types (wire representation in logs) ──────
+	// These are raw TM2 p2p message strings printed via their String() method.
+	case strings.HasPrefix(msg, "[Vote "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[Proposal "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[BlockPart "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[ValidBlock"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[NewRoundStep "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[HasVote "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[VoteSetMaj23"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[VSM23"): // VoteSetMaj23 abbreviated form
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[VoteSetBits"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[VSB "): // VoteSetBits abbreviated form
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "[bc"): // blockchain reactor fast-sync messages
+		return model.EventKnownNoise
+
+	// ── Known noise — low-level P2P connection I/O ────────────────────────
+	// Source: tm2/pkg/p2p/conn/connection.go (both current and older deployed versions).
+	case strings.Contains(msg, "Read PacketMsg"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Received bytes"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Send Ping"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Send Pong"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Receive Ping"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Receive Pong"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Starting pong timer"):
+		return model.EventKnownNoise
+	case msg == "Flush":
+		return model.EventKnownNoise
+	case msg == "Send":
+		return model.EventKnownNoise
+	case msg == "TrySend":
+		return model.EventKnownNoise
+
+	// ── Known noise — peer dialing / connection lifecycle ─────────────────
+	// Source: tm2/pkg/p2p/switch.go, tm2/pkg/p2p/dial.go
+	case strings.Contains(msg, "dialing peer"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Dial succeeded"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Already connected to server"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Retrying to connect"):
+		return model.EventKnownNoise
+
+	// ── Known noise — peer discovery ──────────────────────────────────────
+	// Source: tm2/pkg/p2p/discovery/discovery.go
+	case strings.Contains(msg, "received message"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "running peer discovery"):
+		return model.EventKnownNoise
+
+	// ── Known noise — RPC / HTTP ──────────────────────────────────────────
+	// Source: tm2/pkg/bft/rpc/lib/server/handlers.go
+	case strings.Contains(msg, "HTTP HANDLER"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "HTTPRestRPC"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Served RPC HTTP response"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "started Span"):
+		return model.EventKnownNoise
+
+	// ── Known noise — service lifecycle ───────────────────────────────────
+	// Source: tm2/pkg/service/service.go — every service logs "Starting/Stopping X".
+	case strings.HasPrefix(msg, "Starting "):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "Stopping "):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "ConsensusReactor"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "InitChainer:"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Consensus ticker"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "P2P Node ID"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Version info"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "ABCI Handshake"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "ABCI Replay"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Completed ABCI Handshake"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Need to set a buffer"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "ignoring dial request for existing peer"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Updates to validators"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Default configuration initialized"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Updated configuration saved"):
+		return model.EventKnownNoise
+
+	// ── Known noise — Go panic stack traces ────────────────────────────────
+	// These appear when a goroutine panics; the actual panic is surfaced via
+	// other findings (CONSENSUS FAILURE, ApplyBlock error, etc.).
+	case strings.HasPrefix(msg, "github.com/"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "runtime."):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "/gnoroot/"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "/usr/local/go/"):
+		return model.EventKnownNoise
+
+	// ── Known noise — gnoland startup banner (ASCII art) ──────────────────
+	case strings.Contains(msg, "_ `"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "\\_,"):
+		return model.EventKnownNoise
+	case msg == "/___/":
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "___"):
+		return model.EventKnownNoise
+	case strings.HasPrefix(msg, "__ "):
+		return model.EventKnownNoise
 
 	default:
 		return model.EventUnknown
@@ -410,6 +652,41 @@ func toInt64(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// NormalizeMessage collapses variable runtime data (heights, hashes, bit
+// arrays, whitespace) so that structurally identical log messages share the
+// same key regardless of the block height or round they were emitted at.
+func NormalizeMessage(msg string) string {
+	key := timestampRE.ReplaceAllString(msg, "T")
+	key = bitArrayRE.ReplaceAllString(key, "BA{...}")
+	key = hexSeqRE.ReplaceAllString(key, "X")
+	key = digitSeqRE.ReplaceAllString(key, "N")
+	key = whitespaceRE.ReplaceAllString(key, " ")
+	return strings.TrimSpace(key)
+}
+
+// StreamCategoryLines re-reads r and writes every raw log line whose
+// normalised message matches targetKey to w.
+func StreamCategoryLines(source model.Source, r io.Reader, targetKey string, w io.Writer) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		raw := scanner.Text()
+		if raw == "" {
+			continue
+		}
+		event, _ := ParseLogLine(source, raw, lineNo)
+		if event.Kind != model.EventUnknown {
+			continue
+		}
+		if NormalizeMessage(event.Message) == targetKey {
+			fmt.Fprintf(w, "%s\n", raw)
+		}
+	}
+	return scanner.Err()
 }
 
 func DefaultNodeName(path string, used map[string]int) string {

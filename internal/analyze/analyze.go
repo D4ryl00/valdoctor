@@ -10,12 +10,13 @@ import (
 )
 
 type Input struct {
-	Genesis  model.Genesis
-	Sources  []model.Source
-	Events   []model.Event
-	Warnings []string
-	Verbose  bool
-	Metadata model.Metadata // optional; zero value means not provided
+	Genesis             model.Genesis
+	Sources             []model.Source
+	Events              []model.Event
+	Warnings            []string
+	UnclassifiedCounts  map[string]model.UnclassifiedEntry
+	Verbose             bool
+	Metadata            model.Metadata // optional; zero value means not provided
 }
 
 func BuildReport(input Input) model.Report {
@@ -71,6 +72,22 @@ func BuildReport(input Input) model.Report {
 		}
 	}
 	report.ConfidenceTooLow = totalClassified == 0
+
+	// Build sorted unclassified frequency table (descending by count).
+	if len(input.UnclassifiedCounts) > 0 {
+		entries := make([]model.UnclassifiedEntry, 0, len(input.UnclassifiedCounts))
+		for _, e := range input.UnclassifiedCounts {
+			entries = append(entries, e)
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Count != entries[j].Count {
+				return entries[i].Count > entries[j].Count
+			}
+			return entries[i].Message < entries[j].Message
+		})
+		report.UnclassifiedCounts = entries
+	}
+
 
 	return report
 }
