@@ -1,8 +1,10 @@
 package parse
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -19,17 +21,21 @@ var (
 	voteSetRE         = regexp.MustCompile(`\+2/3:([^(]+)\([^)]+\) BA\{(\d+):([x_]+)\}`)
 )
 
-func ParseLogFile(source model.Source, data []byte) ([]model.Event, []string) {
-	lines := strings.Split(string(data), "\n")
-	events := make([]model.Event, 0, len(lines))
-	warnings := make([]string, 0)
+func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	for i, raw := range lines {
+	events := make([]model.Event, 0)
+	warnings := make([]string, 0)
+	lineNo := 0
+
+	for scanner.Scan() {
+		lineNo++
+		raw := scanner.Text()
 		if raw == "" {
 			continue
 		}
-
-		event, warning := ParseLogLine(source, raw, i+1)
+		event, warning := ParseLogLine(source, raw, lineNo)
 		if warning != "" {
 			warnings = append(warnings, warning)
 		}
@@ -39,7 +45,7 @@ func ParseLogFile(source model.Source, data []byte) ([]model.Event, []string) {
 		events = append(events, event)
 	}
 
-	return events, warnings
+	return events, warnings, scanner.Err()
 }
 
 func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, string) {

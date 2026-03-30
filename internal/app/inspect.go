@@ -146,11 +146,15 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 	warnings := append([]string(nil), metadataWarnings...)
 
 	for _, source := range sources {
-		data, readErr := readLogFile(source.Path)
-		if readErr != nil {
-			return fmt.Errorf("unable to read log %s: %w", source.Path, readErr)
+		rc, openErr := openLogFile(source.Path)
+		if openErr != nil {
+			return fmt.Errorf("unable to open log %s: %w", source.Path, openErr)
 		}
-		fileEvents, fileWarnings := parse.ParseLogFile(source, data)
+		fileEvents, fileWarnings, parseErr := parse.ParseLogFile(source, rc)
+		rc.Close()
+		if parseErr != nil {
+			return fmt.Errorf("error reading log %s: %w", source.Path, parseErr)
+		}
 		events = append(events, filterWindow(fileEvents, since, until)...)
 		warnings = append(warnings, fileWarnings...)
 	}
@@ -409,22 +413,28 @@ func parseWindow(sinceRaw, untilRaw string) (time.Time, time.Time, error) {
 	return since.UTC(), until.UTC(), nil
 }
 
-func readLogFile(path string) ([]byte, error) {
+func openLogFile(path string) (io.ReadCloser, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	if strings.HasSuffix(path, ".gz") {
 		gr, err := gzip.NewReader(f)
 		if err != nil {
+			f.Close()
 			return nil, err
 		}
-		defer gr.Close()
-		return io.ReadAll(gr)
+		return struct {
+			io.Reader
+			io.Closer
+		}{gr, closerFunc(func() error { gr.Close(); return f.Close() })}, nil
 	}
-	return io.ReadAll(f)
+	return f, nil
 }
+
+type closerFunc func() error
+
+func (c closerFunc) Close() error { return c() }
 
 func filterWindow(events []model.Event, since, until time.Time) []model.Event {
 	if since.IsZero() && until.IsZero() {
