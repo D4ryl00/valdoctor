@@ -49,6 +49,11 @@ type ParseStats struct {
 	// PeerRoundStates maps each peer's p2p address (g1xxx…) to its last-known
 	// consensus state, inferred from received [NewRoundStep …] gossip messages.
 	PeerRoundStates map[string]model.PeerRoundState
+	// StuckHeight is the highest rs.Height seen in "No votes to send, sleeping"
+	// gossip logs.  When greater than the last observed FinalizeCommit height
+	// it reveals that the chain actually committed more blocks than the parsed
+	// events show — the missing commits are in a log window not provided.
+	StuckHeight int64
 }
 
 func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, map[string]model.UnclassifiedEntry, ParseStats, error) {
@@ -96,10 +101,18 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, ma
 }
 
 // collectPeerGossip extracts peer consensus state from p2p gossip messages that
-// are otherwise dropped as known noise. Only [Vote ...] and [NewRoundStep ...]
-// messages are inspected; everything else is skipped immediately.
+// are otherwise dropped as known noise. Only [Vote ...], [NewRoundStep ...], and
+// "No votes to send, sleeping" messages are inspected; everything else is skipped.
 func collectPeerGossip(event model.Event, stats *ParseStats) {
 	msg := event.Message
+	if strings.Contains(msg, "No votes to send") {
+		// rs.Height reveals the height the node is currently stuck trying to commit.
+		// JSON numbers decode as float64; convert carefully.
+		if h, ok := jsonInt64Field(event.Fields, "rs.Height"); ok && h > stats.StuckHeight {
+			stats.StuckHeight = h
+		}
+		return
+	}
 	if strings.HasPrefix(msg, "[Vote ") {
 		if m := peerVoteRE.FindStringSubmatch(msg); m != nil {
 			if h, err := strconv.ParseInt(m[1], 10, 64); err == nil && h > stats.MaxPeerVoteHeight {
@@ -142,6 +155,28 @@ func extractPeerAddr(fields map[string]any) string {
 		return m[1]
 	}
 	return ""
+}
+
+// jsonInt64Field reads a numeric field from a map[string]any (where JSON numbers
+// decode as float64) and returns it as int64. Returns (0, false) when absent or
+// not a number.
+func jsonInt64Field(fields map[string]any, key string) (int64, bool) {
+	if fields == nil {
+		return 0, false
+	}
+	v, ok := fields[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 func ParseLogLine(source model.Source, raw string, lineNo int) (model.Event, string) {

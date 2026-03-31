@@ -216,6 +216,17 @@ func Text(report model.Report, opts TextOptions) string {
 			if node.ProposalSignedCount > 0 {
 				fmt.Fprintf(&b, "  proposals signed: %d\n", node.ProposalSignedCount)
 			}
+			if node.LastAppHash != "" {
+				short := node.LastAppHash
+				if len(short) > 16 {
+					short = short[:16] + "…"
+				}
+				fmt.Fprintf(&b, "  appHash h%d: %s\n", node.LastAppHashHeight, c.dim(short))
+			}
+			if node.StuckAtHeight > node.HighestCommit {
+				fmt.Fprintf(&b, "  %s stuck trying to commit h%d (%d block(s) past last observed commit)\n",
+					c.yellow("gossip:"), node.StuckAtHeight, node.StuckAtHeight-node.HighestCommit)
+			}
 			// Show peer gossip states when they differ from the local commit height,
 			// indicating what remote peers were doing at the time of any stall.
 			if len(node.PeerStates) > 0 {

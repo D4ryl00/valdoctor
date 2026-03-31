@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ type NodePeerStats struct {
 	// RoundStates maps each peer's p2p address (g1xxx…) to its last-known
 	// consensus round state, inferred from [NewRoundStep …] gossip messages.
 	RoundStates map[string]model.PeerRoundState
+	// StuckHeight is the highest rs.Height seen in "No votes to send" logs.
+	StuckHeight int64
 }
 
 type Input struct {
@@ -144,6 +147,11 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 		}
 
 		switch event.Kind {
+		case model.EventCommittedState:
+			if h, ok := event.Fields["appHash"].(string); ok && h != "" && event.Height > summary.LastAppHashHeight {
+				summary.LastAppHash = h
+				summary.LastAppHashHeight = event.Height
+			}
 		case model.EventFinalizeCommit:
 			summary.CommitCount++
 			if event.Height > summary.HighestCommit {
@@ -263,6 +271,9 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 			continue
 		}
 		summary.PeerVoteMaxHeight = ps.MaxVoteHeight
+		if ps.StuckHeight > summary.HighestCommit {
+			summary.StuckAtHeight = ps.StuckHeight
+		}
 		if len(ps.RoundStates) > 0 {
 			states := make([]model.PeerRoundState, 0, len(ps.RoundStates))
 			for _, rs := range ps.RoundStates {
@@ -339,6 +350,11 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 					formatDuration(noCommitWindowSpan),
 					node.Start.UTC().Format("15:04:05Z"),
 					node.End.UTC().Format("15:04:05Z"))
+			}
+			if node.StuckAtHeight > 0 {
+				summary += fmt.Sprintf(
+					" Gossip logs show the node was stuck trying to commit h%d.",
+					node.StuckAtHeight)
 			}
 			conf := model.ConfidenceMedium
 			if !node.Start.IsZero() && noCommitWindowSpan >= 30*time.Minute {
@@ -1052,6 +1068,182 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		}
 	}
 
+	// ── AppHash divergence detection ────────────────────────────────────────
+	// Two complementary methods; the first match wins (by lowest height).
+	//
+	// Method A — Committed state: compare appHash across nodes at the same
+	// height. Works when multiple validators committed the same block in their
+	// log window.
+	//
+	// Method B — ProposalBlock invalid err field: each rejection log says
+	// "Expected X, got Y" where X = this node's local AppHash for the previous
+	// block and Y = the proposer's AppHash. Comparing X across rejecting
+	// validators reveals which node diverged even when Committed state events
+	// are absent (e.g. very short log windows).
+	{
+		type hashAt struct {
+			node    string
+			appHash string
+			source  string // "committed" or "inferred"
+		}
+		heightHashes := map[int64][]hashAt{}
+
+		// Method A: Committed state events.
+		for node, nodeEvents := range grouped {
+			seen := map[int64]bool{}
+			for _, ev := range nodeEvents {
+				if ev.Kind != model.EventCommittedState || ev.Height == 0 || seen[ev.Height] {
+					continue
+				}
+				h, ok := ev.Fields["appHash"].(string)
+				if !ok || h == "" {
+					continue
+				}
+				heightHashes[ev.Height] = append(heightHashes[ev.Height], hashAt{node: node, appHash: h, source: "committed"})
+				seen[ev.Height] = true
+			}
+		}
+
+		// Method B: infer local AppHash from "Expected X, got Y" in rejection errors.
+		// The "Expected" value is the rejecting node's local AppHash at height-1.
+		appHashErrRE := regexp.MustCompile(`Expected ([0-9A-Fa-f]{40,}), got ([0-9A-Fa-f]{40,})`)
+		for node, nodeEvents := range grouped {
+			seen := map[int64]bool{}
+			for _, ev := range nodeEvents {
+				if ev.Kind != model.EventPrevoteProposalInvalid || ev.Height == 0 || seen[ev.Height] {
+					continue
+				}
+				errStr, _ := ev.Fields["err"].(string)
+				if errStr == "" {
+					continue
+				}
+				m := appHashErrRE.FindStringSubmatch(errStr)
+				if m == nil {
+					continue
+				}
+				committedH := ev.Height - 1
+				if committedH <= 0 || seen[committedH] {
+					continue
+				}
+				localHash := m[1] // "Expected" = this node's local AppHash
+				// Only add if not already covered by a Committed state entry for this node/height.
+				alreadyHave := false
+				for _, e := range heightHashes[committedH] {
+					if e.node == node {
+						alreadyHave = true
+						break
+					}
+				}
+				if !alreadyHave {
+					heightHashes[committedH] = append(heightHashes[committedH], hashAt{node: node, appHash: localHash, source: "inferred"})
+				}
+				seen[committedH] = true
+			}
+		}
+
+		type divergence struct {
+			height  int64
+			entries []hashAt
+		}
+		var divs []divergence
+		for height, entries := range heightHashes {
+			if len(entries) < 2 {
+				continue
+			}
+			first := entries[0].appHash
+			differs := false
+			for _, e := range entries[1:] {
+				if e.appHash != first {
+					differs = true
+					break
+				}
+			}
+			if differs {
+				divs = append(divs, divergence{height: height, entries: entries})
+			}
+		}
+
+		if len(divs) > 0 {
+			sort.Slice(divs, func(i, j int) bool { return divs[i].height < divs[j].height })
+			d := divs[0]
+
+			// Sort entries so diverging nodes (non-majority hash) come last.
+			hashCount := map[string]int{}
+			for _, e := range d.entries {
+				hashCount[e.appHash]++
+			}
+			sort.SliceStable(d.entries, func(i, j int) bool {
+				return hashCount[d.entries[i].appHash] > hashCount[d.entries[j].appHash]
+			})
+
+			ev := make([]model.Evidence, 0, len(d.entries))
+			for _, e := range d.entries {
+				src := ""
+				if e.source == "inferred" {
+					src = " (inferred from rejection error)"
+				}
+				ev = append(ev, model.Evidence{
+					Node:    e.node,
+					Message: fmt.Sprintf("h%d appHash=%s%s", d.height, e.appHash, src),
+				})
+			}
+
+			// Identify diverging nodes (those with the minority hash).
+			majorityHash := d.entries[0].appHash
+			var divergingNodes []string
+			for _, e := range d.entries {
+				if e.appHash != majorityHash {
+					divergingNodes = append(divergingNodes, e.node)
+				}
+			}
+			divergingNote := ""
+			if len(divergingNodes) > 0 {
+				divergingNote = fmt.Sprintf(" Node(s) %s computed a different state than the rest.",
+					strings.Join(divergingNodes, ", "))
+			}
+			laterNote := ""
+			if len(divs) > 1 {
+				laterNote = fmt.Sprintf(" Divergence also detected at %d later height(s).", len(divs)-1)
+			}
+			conf := model.ConfidenceHigh
+			allInferred := true
+			for _, e := range d.entries {
+				if e.source != "inferred" {
+					allInferred = false
+					break
+				}
+			}
+			if allInferred {
+				conf = model.ConfidenceMedium
+			}
+			findings = append(findings, model.Finding{
+				ID:         "apphash-divergence",
+				Title:      fmt.Sprintf("AppHash divergence between validators at height %d", d.height),
+				Severity:   model.SeverityCritical,
+				Confidence: conf,
+				Scope:      "global",
+				Summary: fmt.Sprintf(
+					"Different validators computed different AppHashes after applying block %d.%s"+
+						" This means the same transactions produced different state — a non-determinism bug.%s",
+					d.height, divergingNote, laterNote,
+				),
+				Evidence: ev,
+				PossibleCauses: []string{
+					"non-deterministic transaction execution — different gas consumption, map iteration order, or time-dependent logic",
+					"different software versions with divergent execution semantics",
+					"data corruption on one or more nodes",
+				},
+				SuggestedActions: []string{
+					fmt.Sprintf("run `curl -s '<rpc>/block_results?height=%d'` on the diverging node (%s) and on a healthy node — compare tx results and gas consumed",
+						d.height, strings.Join(divergingNodes, ", ")),
+					fmt.Sprintf("the transaction that caused non-determinism is in block %d (txs field in Committed state log) — identify it and check for gas metering differences or OOG errors", d.height),
+					"verify all validators are running the same binary version",
+					fmt.Sprintf("confirm that all nodes agreed on AppHash at h%d — if they already diverged there, the root cause is earlier", d.height-1),
+				},
+			})
+		}
+	}
+
 	// ── Stall detection ─────────────────────────────────────────────────────
 	// Flag when a node's last commit was well before the end of its log window,
 	// suggesting it halted or lost quorum.
@@ -1333,6 +1525,15 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		if node.AvgBlockTime > 0 {
 			avgBlockNote = fmt.Sprintf(" Average block time was %s.", formatDuration(node.AvgBlockTime))
 		}
+		stuckNote := ""
+		if node.StuckAtHeight > node.HighestCommit {
+			gap := node.StuckAtHeight - node.HighestCommit
+			stuckNote = fmt.Sprintf(
+				" Gossip logs show the node was stuck trying to commit h%d — "+
+					"%d block(s) beyond the last observed commit, suggesting those blocks "+
+					"were committed in a log window not provided.",
+				node.StuckAtHeight, gap)
+		}
 		findings = append(findings, model.Finding{
 			ID:         "stall-after-last-commit-" + node.Name,
 			Title:      fmt.Sprintf("%s: no commits for %s after height %d", node.Name, formatDuration(node.StallDuration), node.HighestCommit),
@@ -1340,8 +1541,8 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			Confidence: conf,
 			Scope:      node.Name,
 			Summary: fmt.Sprintf(
-				"Last commit at h%d; no further commits observed for %s to the end of the log window.%s",
-				node.HighestCommit, formatDuration(node.StallDuration), avgBlockNote,
+				"Last commit at h%d; no further commits observed for %s to the end of the log window.%s%s",
+				node.HighestCommit, formatDuration(node.StallDuration), avgBlockNote, stuckNote,
 			),
 			Evidence:         stallEv,
 			PossibleCauses:   possibleCauses,

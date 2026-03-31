@@ -178,6 +178,9 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		if fileStats.MaxPeerVoteHeight > existing.MaxPeerVoteHeight {
 			existing.MaxPeerVoteHeight = fileStats.MaxPeerVoteHeight
 		}
+		if fileStats.StuckHeight > existing.StuckHeight {
+			existing.StuckHeight = fileStats.StuckHeight
+		}
 		if existing.PeerRoundStates == nil {
 			existing.PeerRoundStates = map[string]model.PeerRoundState{}
 		}
@@ -215,6 +218,7 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		analyzePeerStats[node] = analyze.NodePeerStats{
 			MaxVoteHeight: ps.MaxPeerVoteHeight,
 			RoundStates:   ps.PeerRoundStates,
+			StuckHeight:   ps.StuckHeight,
 		}
 	}
 

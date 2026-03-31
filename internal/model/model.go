@@ -219,6 +219,17 @@ type NodeSummary struct {
 	PrecommitsTotal    int   `json:"precommits_total,omitempty"`
 	PrecommitsMaj23    bool  `json:"precommits_maj23,omitempty"`
 
+	// LastAppHash and LastAppHashHeight are the AppHash and height from the last
+	// Committed state log entry. Used to compare state across validators.
+	LastAppHash       string `json:"last_app_hash,omitempty"`
+	LastAppHashHeight int64  `json:"last_app_hash_height,omitempty"`
+
+	// StuckAtHeight is the highest rs.Height seen in "No votes to send" gossip
+	// logs. When > HighestCommit it reveals that the chain committed more blocks
+	// than the FinalizeCommit events captured — i.e. the log window started after
+	// those commits, or the commits are in a log file that was not provided.
+	StuckAtHeight int64 `json:"stuck_at_height,omitempty"`
+
 	// Fast-sync: set when SwitchToConsensus was observed in this node's logs.
 	JoinedViaFastSync    bool  `json:"joined_via_fast_sync,omitempty"`
 	FastSyncSwitchHeight int64 `json:"fast_sync_switch_height,omitempty"`
