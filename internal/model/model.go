@@ -62,6 +62,10 @@ type MetadataNode struct {
 	ValidatorName    string   `toml:"validator_name,omitempty" json:"validator_name,omitempty"`
 	ValidatorAddress string   `toml:"validator_address,omitempty" json:"validator_address,omitempty"`
 	ValidatorPubKey  string   `toml:"validator_pubkey,omitempty" json:"validator_pubkey,omitempty"`
+	// RPCEndpoint is the base URL of this node's RPC server (e.g.
+	// "http://host:26657"). When set, valdoctor can call /block_results and
+	// /abci_info to enrich findings with live chain state.
+	RPCEndpoint      string   `toml:"rpc_endpoint,omitempty" json:"rpc_endpoint,omitempty"`
 }
 
 type MetadataTopology struct {

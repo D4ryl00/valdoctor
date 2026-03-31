@@ -1233,13 +1233,7 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 					"different software versions with divergent execution semantics",
 					"data corruption on one or more nodes",
 				},
-				SuggestedActions: []string{
-					fmt.Sprintf("run `curl -s '<rpc>/block_results?height=%d'` on the diverging node (%s) and on a healthy node — compare tx results and gas consumed",
-						d.height, strings.Join(divergingNodes, ", ")),
-					fmt.Sprintf("the transaction that caused non-determinism is in block %d (txs field in Committed state log) — identify it and check for gas metering differences or OOG errors", d.height),
-					"verify all validators are running the same binary version",
-					fmt.Sprintf("confirm that all nodes agreed on AppHash at h%d — if they already diverged there, the root cause is earlier", d.height-1),
-				},
+				SuggestedActions: buildDivergenceSuggestedActions(d.height, divergingNodes, meta),
 			})
 		}
 	}
@@ -1880,6 +1874,34 @@ func firstEvidence(events []model.Event, kind model.EventKind, limit int) []mode
 		}
 	}
 	return out
+}
+
+// buildDivergenceSuggestedActions returns suggested actions for an AppHash
+// divergence finding. When no RPC endpoints are configured in the metadata it
+// appends a hint asking the operator to add them.
+func buildDivergenceSuggestedActions(height int64, divergingNodes []string, meta model.Metadata) []string {
+	divNodeStr := strings.Join(divergingNodes, ", ")
+	actions := []string{
+		fmt.Sprintf("run `curl -s '<rpc>/block_results?height=%d'` on the diverging node (%s) and on a healthy node — compare tx results and gas consumed",
+			height, divNodeStr),
+		fmt.Sprintf("the transaction that caused non-determinism is in block %d (txs field in Committed state log) — identify it and check for gas metering differences or OOG errors", height),
+		"verify all validators are running the same binary version",
+		fmt.Sprintf("confirm that all nodes agreed on AppHash at h%d — if they already diverged there, the root cause is earlier", height-1),
+	}
+	// Check whether any node in the metadata has an RPC endpoint configured.
+	hasRPC := false
+	for _, n := range meta.Nodes {
+		if n.RPCEndpoint != "" {
+			hasRPC = true
+			break
+		}
+	}
+	if !hasRPC {
+		actions = append(actions,
+			"add `rpc_endpoint = \"http://NODE:26657\"` to each node in your metadata file to enable automatic block_results enrichment by valdoctor",
+		)
+	}
+	return actions
 }
 
 func evidenceFromWarnings(warnings []string) []model.Evidence {

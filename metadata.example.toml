@@ -1,0 +1,80 @@
+# valdoctor metadata file
+# Pass this file with: valdoctor inspect --metadata metadata.toml ...
+#
+# version must be 1.
+version = 1
+
+# chain_id must match the genesis.json chain_id.
+chain_id = "mychain-1"
+
+# ── Node definitions ─────────────────────────────────────────────────────────
+# Each [nodes.<name>] section associates a human-readable name with one or
+# more log files and optional enrichment fields.
+[nodes]
+
+  [nodes.validator_a]
+    # role must be one of: validator, sentry, seed
+    role = "validator"
+
+    # Log files belonging to this node (supports .gz).
+    # Paths are relative to the working directory or absolute.
+    files = [
+      "logs/validator_a.log",
+      "logs/validator_a.log.gz",
+    ]
+
+    # node_id is the TM2 P2P node ID (hex, 40 chars).
+    # Used to resolve peer_aliases and topology entries.
+    node_id = "abc123def456abc123def456abc123def456abc1"
+
+    # Validator identity fields — used to cross-reference genesis validators.
+    validator_name    = "Validator A"
+    validator_address = "g1abc123..."
+    validator_pubkey  = "gpub1..."
+
+    # rpc_endpoint is the base URL of this node's RPC server.
+    # When set, valdoctor will call /block_results and /abci_info to enrich
+    # AppHash divergence findings with per-transaction gas and error details.
+    # Omit or leave empty to skip RPC calls for this node.
+    # Use --offline to disable all RPC calls regardless of this setting.
+    rpc_endpoint = "http://validator-a.example.com:26657"
+
+  [nodes.validator_b]
+    role  = "validator"
+    files = ["logs/validator_b.log"]
+    node_id           = "def456abc123def456abc123def456abc123def4"
+    validator_name    = "Validator B"
+    validator_address = "g1def456..."
+    validator_pubkey  = "gpub1..."
+    rpc_endpoint      = "http://validator-b.example.com:26657"
+
+  [nodes.sentry_a]
+    role  = "sentry"
+    files = ["logs/sentry_a.log"]
+    node_id      = "111aaa222bbb333ccc444ddd555eee666fff7777"
+    rpc_endpoint = "http://sentry-a.example.com:26657"
+
+  [nodes.sentry_b]
+    role  = "sentry"
+    files = ["logs/sentry_b.log"]
+    node_id = "888aaa999bbb000ccc111ddd222eee333fff4444"
+
+# ── Peer aliases ─────────────────────────────────────────────────────────────
+# Map raw P2P addresses (as they appear in log messages) to friendly names.
+# Format: "NODE_ID@HOST:PORT" = "friendly_name"
+# valdoctor uses these when displaying peer connectivity events.
+[peer_aliases]
+  "abc123def456abc123def456abc123def456abc1@10.0.0.1:26656" = "validator_a"
+  "def456abc123def456abc123def456abc123def4@10.0.0.2:26656" = "validator_b"
+  "111aaa222bbb333ccc444ddd555eee666fff7777@10.0.0.3:26656" = "sentry_a"
+  "888aaa999bbb000ccc111ddd222eee333fff4444@10.0.0.4:26656" = "sentry_b"
+
+# ── Topology ─────────────────────────────────────────────────────────────────
+# Describe the validator ↔ sentry relationships in your network.
+# valdoctor uses this to produce precise "validator isolated from sentry" findings
+# instead of generic cross-role warnings.
+[topology]
+  [topology.validator_to_sentries]
+    # Each key is a validator node name; the value is a list of sentry node names.
+    validator_a = ["sentry_a", "sentry_b"]
+    validator_b = ["sentry_a"]

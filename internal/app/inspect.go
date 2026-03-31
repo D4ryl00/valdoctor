@@ -19,6 +19,7 @@ import (
 	"github.com/D4ryl00/valdoctor/internal/model"
 	"github.com/D4ryl00/valdoctor/internal/parse"
 	"github.com/D4ryl00/valdoctor/internal/render"
+	"github.com/D4ryl00/valdoctor/internal/rpc"
 	"github.com/gnolang/gno/tm2/pkg/commands"
 )
 
@@ -40,6 +41,7 @@ type inspectCfg struct {
 	maxFindings      int
 	maxHealth        int
 	categoryN        int
+	offline          bool
 }
 
 type multiString []string
@@ -85,6 +87,7 @@ func (c *inspectCfg) RegisterFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.maxFindings, "max-findings", 0, "maximum number of findings rendered in text output (default: 20)")
 	fs.IntVar(&c.maxHealth, "max-health", 0, "maximum number of nodes shown in health summary (default: 5; 0 in verbose)")
 	fs.IntVar(&c.categoryN, "category", 0, "browse all log lines for unclassified category N (from -show-unclassified table)")
+	fs.BoolVar(&c.offline, "offline", false, "disable all network calls (skip RPC enrichment even when endpoints are configured)")
 }
 
 func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
@@ -232,6 +235,14 @@ func execInspect(_ context.Context, cfg *inspectCfg, io commands.IO) error {
 		Metadata:           metadata,
 		PeerStatsByNode:    analyzePeerStats,
 	})
+
+	// ── RPC enrichment ──────────────────────────────────────────────────────
+	// When metadata provides RPC endpoints and --offline is not set, call
+	// /block_results on the height where AppHash divergence was detected to
+	// add tx-level evidence to the finding.
+	if !cfg.offline {
+		enrichWithRPC(&report, metadata)
+	}
 
 	var generationErr error
 	if cfg.generateMetadata != "" {
@@ -537,6 +548,70 @@ func openPager() (io.Writer, func()) {
 	return pw, func() {
 		pw.Close()
 		cmd.Wait()
+	}
+}
+
+// enrichWithRPC looks for AppHash-divergence findings in the report and, for
+// each one, calls /block_results on every node that has an RPC endpoint
+// configured in the metadata. It appends the tx-level evidence as additional
+// evidence items on the finding so the operator can immediately see which
+// transaction produced different gas/state across validators.
+func enrichWithRPC(report *model.Report, meta model.Metadata) {
+	// Collect nodes with RPC endpoints.
+	type rpcNode struct {
+		name     string
+		endpoint string
+	}
+	var rpcNodes []rpcNode
+	for name, node := range meta.Nodes {
+		if node.RPCEndpoint != "" {
+			rpcNodes = append(rpcNodes, rpcNode{name: name, endpoint: node.RPCEndpoint})
+		}
+	}
+	if len(rpcNodes) == 0 {
+		return
+	}
+
+	for i, finding := range report.Findings {
+		if finding.ID != "apphash-divergence" {
+			continue
+		}
+		// Parse the divergence height from the finding title ("... at height N").
+		var height int64
+		fmt.Sscanf(finding.Title, "AppHash divergence between validators at height %d", &height)
+		if height <= 0 {
+			continue
+		}
+
+		// Fetch block_results from all configured RPC nodes.
+		for _, node := range rpcNodes {
+			br, err := rpc.FetchBlockResults(node.endpoint, height)
+			if err != nil {
+				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
+					Node:    node.name,
+					Message: fmt.Sprintf("RPC block_results fetch failed: %v", err),
+				})
+				continue
+			}
+			if len(br.DeliverTxs) == 0 {
+				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
+					Node:    node.name,
+					Message: fmt.Sprintf("block_results h%d: no transactions", height),
+				})
+				continue
+			}
+			for idx, tx := range br.DeliverTxs {
+				msg := fmt.Sprintf("block_results h%d tx[%d]: gas_wanted=%d gas_used=%d",
+					height, idx, tx.GasWanted, tx.GasUsed)
+				if tx.Error != "" {
+					msg += " error=" + tx.Error
+				}
+				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
+					Node:    node.name,
+					Message: msg,
+				})
+			}
+		}
 	}
 }
 
