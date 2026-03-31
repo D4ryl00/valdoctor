@@ -599,6 +599,74 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			})
 		}
 
+		// Invalid proposal block — the proposer sent a block whose hash (AppHash,
+		// TxHash, etc.) does not match what this node computed. This indicates
+		// state divergence or a non-deterministic transaction and is usually a
+		// sign of a software bug. It prevents consensus from progressing.
+		if count := countByKind(nodeEvents, model.EventPrevoteProposalInvalid); count > 0 {
+			// Build evidence with the err field from each event (up to 3 samples).
+			ev := make([]model.Evidence, 0, 3)
+			for _, e := range nodeEvents {
+				if e.Kind != model.EventPrevoteProposalInvalid {
+					continue
+				}
+				msg := e.Message
+				if errStr, ok := e.Fields["err"].(string); ok && errStr != "" {
+					msg = msg + ": " + errStr
+				}
+				ev = append(ev, model.Evidence{
+					Node:      e.Node,
+					Timestamp: formatMaybeTime(e.Timestamp),
+					Path:      e.Path,
+					Line:      e.Line,
+					Message:   msg,
+				})
+				if len(ev) == 3 {
+					break
+				}
+			}
+			// Find the height of the first invalid proposal.
+			firstInvalidH := int64(0)
+			for _, e := range nodeEvents {
+				if e.Kind == model.EventPrevoteProposalInvalid && e.Height > 0 {
+					firstInvalidH = e.Height
+					break
+				}
+			}
+			heightNote := ""
+			if firstInvalidH > 0 {
+				heightNote = fmt.Sprintf(" at h%d", firstInvalidH)
+			}
+			plural := ""
+			if count > 1 {
+				plural = fmt.Sprintf(" (%d occurrences)", count)
+			}
+			findings = append(findings, model.Finding{
+				ID:         "invalid-proposal-block-" + node,
+				Title:      fmt.Sprintf("%s: proposer sent invalid block%s%s", node, heightNote, plural),
+				Severity:   model.SeverityHigh,
+				Confidence: model.ConfidenceHigh,
+				Scope:      node,
+				Summary: fmt.Sprintf(
+					"%s rejected the proposed block%s because its hash did not match "+
+						"the locally computed state. This indicates state divergence — "+
+						"the proposer and this node applied transactions differently.",
+					node, plural,
+				),
+				Evidence: ev,
+				PossibleCauses: []string{
+					"non-deterministic transaction execution (different result on different nodes)",
+					"software bug introduced by a recent upgrade causing divergent state",
+					"data corruption on the proposer's node",
+				},
+				SuggestedActions: []string{
+					"identify the proposer at the affected height and inspect its logs for ApplyBlock errors",
+					"check whether a recent upgrade changed transaction execution semantics",
+					"compare the AppHash between nodes at the last good height to identify when divergence started",
+				},
+			})
+		}
+
 		// Validator address mismatch — the genesis validator set on this node differs
 		// from what the rest of the network is using.
 		if count := countByKind(nodeEvents, model.EventAddVoteError); count > 0 {
@@ -1008,6 +1076,7 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		peerIsolated := node.CurrentPeers == 0 && node.MaxPeers > 0
 		hasCrash := countByKind(stallEvents, model.EventConsensusFailure) > 0 ||
 			countByKind(stallEvents, model.EventApplyBlockError) > 0
+		invalidProposalCount := countByKind(stallEvents, model.EventPrevoteProposalInvalid)
 		noMaj23Count := countByKind(stallEvents, model.EventFinalizeNoMaj23) +
 			countByKind(stallEvents, model.EventPrecommitNoMaj23)
 		nilPrevoteCount := countByKind(stallEvents, model.EventPrevoteProposalNil)
@@ -1153,6 +1222,11 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		if signerUnavailable {
 			possibleCauses = append(possibleCauses,
 				"remote signer was unavailable throughout the stall window — this node could not sign proposals or votes")
+		}
+		if invalidProposalCount > 0 {
+			possibleCauses = append(possibleCauses,
+				fmt.Sprintf("invalid proposal block rejected %d time(s) — the proposer's block hash did not match "+
+					"this node's computed state, indicating state divergence or a non-deterministic transaction", invalidProposalCount))
 		}
 		// Chain-wide halt: check whether any peer gossip votes were received for
 		// the stall height. If the max vote height equals the last commit height,
