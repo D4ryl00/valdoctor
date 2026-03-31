@@ -325,18 +325,40 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			maxCommit = node.HighestCommit
 		}
 
-		if node.Role == model.RoleValidator && node.CommitCount == 0 && node.TimeoutCount > 0 {
+		// A validator with zero commits is suspicious if:
+		//   (a) consensus timeouts were observed (node was actively trying), or
+		//   (b) the observed window is substantial (>= 5 min) — even without
+		//       consensus events, a long window with no blocks is a clear signal.
+		noCommitWindowSpan := node.End.Sub(node.Start)
+		if node.Role == model.RoleValidator && node.CommitCount == 0 &&
+			(node.TimeoutCount > 0 || (!node.Start.IsZero() && noCommitWindowSpan >= 5*time.Minute)) {
+
+			summary := "No block commit was finalized in the observed window."
+			if noCommitWindowSpan >= 5*time.Minute {
+				summary = fmt.Sprintf("No block commit was finalized in a %s window (%s – %s).",
+					formatDuration(noCommitWindowSpan),
+					node.Start.UTC().Format("15:04:05Z"),
+					node.End.UTC().Format("15:04:05Z"))
+			}
+			conf := model.ConfidenceMedium
+			if !node.Start.IsZero() && noCommitWindowSpan >= 30*time.Minute {
+				conf = model.ConfidenceHigh
+			}
 			findings = append(findings, model.Finding{
 				ID:         "validator-no-first-commit-" + node.Name,
-				Title:      fmt.Sprintf("%s never finalized a block in the observed window", node.Name),
+				Title:      fmt.Sprintf("%s: no commits observed in the entire log window", node.Name),
 				Severity:   model.SeverityHigh,
-				Confidence: model.ConfidenceMedium,
+				Confidence: conf,
 				Scope:      node.Name,
-				Summary:    "Timeouts were observed but no block commit was finalized.",
+				Summary:    summary,
 				PossibleCauses: []string{
-					"insufficient quorum",
-					"peer isolation",
-					"proposal propagation failure",
+					"chain-wide halt started before this log window — the chain was already stopped when logging began",
+					"peer isolation — node had no peers to sync or participate in consensus",
+					"insufficient quorum or proposal propagation failure",
+				},
+				SuggestedActions: []string{
+					"provide earlier logs to determine the last committed height before the stall",
+					"check persistent_peers and network connectivity",
 				},
 			})
 		}
@@ -1043,6 +1065,33 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 				threshold = dyn
 			} else {
 				threshold = 30 * time.Second
+			}
+		}
+		// When there is concrete in-window evidence of stuck consensus (invalid
+		// proposal, consensus panic, or apply-block error), the threshold is
+		// lowered to 2× the average block time (floor 5s). A short log that ends
+		// mid-failure is still worth flagging even if the raw stall duration is
+		// below the normal threshold.
+		hasTerminalEvent := false
+		for _, ev := range grouped[node.Name] {
+			if ev.HasTimestamp && ev.Timestamp.After(node.LastCommitTime) {
+				if ev.Kind == model.EventPrevoteProposalInvalid ||
+					ev.Kind == model.EventConsensusFailure ||
+					ev.Kind == model.EventApplyBlockError {
+					hasTerminalEvent = true
+					break
+				}
+			}
+		}
+		if hasTerminalEvent {
+			lowered := 5 * time.Second
+			if node.AvgBlockTime > 0 {
+				if dyn := 2 * node.AvgBlockTime; dyn > lowered {
+					lowered = dyn
+				}
+			}
+			if lowered < threshold {
+				threshold = lowered
 			}
 		}
 		if node.StallDuration < threshold {

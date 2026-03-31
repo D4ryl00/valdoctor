@@ -331,7 +331,7 @@ func splitConsoleMessageAndFields(rest string) (string, map[string]any) {
 func classifyMessage(msg string) model.EventKind {
 	switch {
 	case msg == "":
-		return model.EventUnknown
+		return model.EventKnownNoise
 
 	// ── Startup / configuration ────────────────────────────────────────────
 	case strings.Contains(msg, "unable to update config field"):
@@ -511,6 +511,12 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventKnownNoise
 	case strings.HasPrefix(msg, "[bc"): // blockchain reactor fast-sync messages
 		return model.EventKnownNoise
+	case strings.Contains(msg, "Blockpool has no peers"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Connection failed @ recvRoutine"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "unable to gracefully close"):
+		return model.EventKnownNoise
 
 	// ── Known noise — low-level P2P connection I/O ────────────────────────
 	// Source: tm2/pkg/p2p/conn/connection.go (both current and older deployed versions).
@@ -560,6 +566,8 @@ func classifyMessage(msg string) model.EventKind {
 	case strings.Contains(msg, "HTTPRestRPC"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "Served RPC HTTP response"):
+		return model.EventKnownNoise
+	case strings.Contains(msg, "Panic in RPC HTTP handler"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "started Span"):
 		return model.EventKnownNoise
