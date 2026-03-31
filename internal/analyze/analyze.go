@@ -219,6 +219,14 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 			}
 		case model.EventSignedProposal:
 			summary.ProposalSignedCount++
+		case model.EventEnterPropose:
+			if addr, ok := event.Fields["proposer"].(string); ok && addr != "" && event.Height > 0 {
+				if summary.ProposerByHeightRound == nil {
+					summary.ProposerByHeightRound = map[string]string{}
+				}
+				key := fmt.Sprintf("%d/%d", event.Height, event.Round)
+				summary.ProposerByHeightRound[key] = addr
+			}
 		case model.EventRemoteSignerFailure:
 			summary.SignerFailureCount++
 		case model.EventRemoteSignerConnect:
@@ -417,11 +425,12 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		type valPos struct {
 			name   string
 			height int64
+			end    time.Time // last timestamp seen in the log for this node
 		}
 		var valPositions []valPos
 		for _, node := range nodes {
 			if node.Role == model.RoleValidator && node.LastHeight > 0 {
-				valPositions = append(valPositions, valPos{node.Name, node.LastHeight})
+				valPositions = append(valPositions, valPos{node.Name, node.LastHeight, node.End})
 			}
 		}
 		if len(valPositions) > 1 {
@@ -435,20 +444,73 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 				}
 			}
 			if gap := maxH - minH; gap > 0 {
+				// Check whether the log windows end at roughly the same real time.
+				// If one log ends significantly earlier than another, the height gap
+				// may simply reflect the missing tail rather than a real divergence.
+				var minEnd, maxEnd time.Time
+				for _, vp := range valPositions {
+					if vp.end.IsZero() {
+						continue
+					}
+					if minEnd.IsZero() || vp.end.Before(minEnd) {
+						minEnd = vp.end
+					}
+					if vp.end.After(maxEnd) {
+						maxEnd = vp.end
+					}
+				}
+
+				// Determine average block time across all validator nodes as a baseline.
+				var avgBT time.Duration
+				var btCount int
+				for _, node := range nodes {
+					if node.Role == model.RoleValidator && node.AvgBlockTime > 0 {
+						avgBT += node.AvgBlockTime
+						btCount++
+					}
+				}
+				if btCount > 0 {
+					avgBT /= time.Duration(btCount)
+				}
+				windowThreshold := 5 * avgBT
+				if windowThreshold < 30*time.Second {
+					windowThreshold = 30 * time.Second
+				}
+
+				windowMismatch := !minEnd.IsZero() && !maxEnd.IsZero() && maxEnd.Sub(minEnd) > windowThreshold
+				noTimestamps := minEnd.IsZero()
+
+				confidence := model.ConfidenceMedium
+				summaryText := fmt.Sprintf("Validators are at different heights at the end of the window (min=%d, max=%d).", minH, maxH)
+				if noTimestamps {
+					confidence = model.ConfidenceLow
+					summaryText += " Log timestamps are absent so window alignment cannot be verified — the gap may reflect truncated logs."
+				} else if windowMismatch {
+					confidence = model.ConfidenceLow
+					summaryText += fmt.Sprintf(
+						" Log windows end at different times (spread: %s), so the height gap may reflect a shorter log rather than a real divergence.",
+						maxEnd.Sub(minEnd).Round(time.Second),
+					)
+				}
+
 				evidence := make([]model.Evidence, 0, len(valPositions))
 				for _, vp := range valPositions {
+					msg := fmt.Sprintf("last height: %d", vp.height)
+					if !vp.end.IsZero() {
+						msg += fmt.Sprintf(", log ends at %s", vp.end.UTC().Format(time.RFC3339))
+					}
 					evidence = append(evidence, model.Evidence{
 						Node:    vp.name,
-						Message: fmt.Sprintf("last height: %d", vp.height),
+						Message: msg,
 					})
 				}
 				findings = append(findings, model.Finding{
 					ID:         "validator-height-divergence",
 					Title:      fmt.Sprintf("Validator height divergence (gap: %d)", gap),
 					Severity:   model.SeverityHigh,
-					Confidence: model.ConfidenceMedium,
+					Confidence: confidence,
 					Scope:      "global",
-					Summary:    fmt.Sprintf("Validators are at different heights at the end of the window (min=%d, max=%d).", minH, maxH),
+					Summary:    summaryText,
 					Evidence:   evidence,
 					PossibleCauses: []string{
 						"one validator crashed or was restarted mid-session",
@@ -1763,6 +1825,100 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		}
 	}
 
+	// ── Proposer identity mismatch ───────────────────────────────────────────
+	// Compare the proposer address logged by each validator node at the same
+	// height/round. A mismatch means the nodes operated with different validator
+	// sets, which is a critical consensus bug.
+	{
+		type hrKey struct {
+			height int64
+			round  int
+		}
+		// For each (height, round): map node name → proposer address it observed.
+		seen := map[hrKey]map[string]string{}
+		for _, node := range nodes {
+			if node.Role != model.RoleValidator {
+				continue
+			}
+			for key, addr := range node.ProposerByHeightRound {
+				var h int64
+				var r int
+				fmt.Sscanf(key, "%d/%d", &h, &r)
+				k := hrKey{h, r}
+				if seen[k] == nil {
+					seen[k] = map[string]string{}
+				}
+				seen[k][node.Name] = addr
+			}
+		}
+
+		type mismatch struct {
+			key       hrKey
+			nodeAddrs map[string]string
+		}
+		var mismatches []mismatch
+		for k, nodeAddrs := range seen {
+			if len(nodeAddrs) < 2 {
+				continue
+			}
+			first := ""
+			disagree := false
+			for _, addr := range nodeAddrs {
+				if first == "" {
+					first = addr
+				} else if addr != first {
+					disagree = true
+					break
+				}
+			}
+			if disagree {
+				mismatches = append(mismatches, mismatch{k, nodeAddrs})
+			}
+		}
+		sort.Slice(mismatches, func(i, j int) bool {
+			if mismatches[i].key.height != mismatches[j].key.height {
+				return mismatches[i].key.height < mismatches[j].key.height
+			}
+			return mismatches[i].key.round < mismatches[j].key.round
+		})
+
+		for _, mm := range mismatches {
+			nodeNames := make([]string, 0, len(mm.nodeAddrs))
+			for n := range mm.nodeAddrs {
+				nodeNames = append(nodeNames, n)
+			}
+			sort.Strings(nodeNames)
+			ev := make([]model.Evidence, 0, len(nodeNames))
+			for _, n := range nodeNames {
+				ev = append(ev, model.Evidence{
+					Node:    n,
+					Message: fmt.Sprintf("proposer seen: %s", mm.nodeAddrs[n]),
+				})
+			}
+			findings = append(findings, model.Finding{
+				ID:         fmt.Sprintf("proposer-mismatch-h%d-r%d", mm.key.height, mm.key.round),
+				Title:      fmt.Sprintf("Proposer disagreement at height %d round %d", mm.key.height, mm.key.round),
+				Severity:   model.SeverityCritical,
+				Confidence: model.ConfidenceHigh,
+				Scope:      "global",
+				Summary: fmt.Sprintf(
+					"At height %d round %d, validators logged different proposer addresses. "+
+						"This means the nodes were operating with diverged validator sets — a critical consensus bug.",
+					mm.key.height, mm.key.round,
+				),
+				Evidence: ev,
+				PossibleCauses: []string{
+					"AppHash divergence at an earlier height caused validator set state to diverge",
+					"a software bug in proposer election or validator set update logic",
+				},
+				SuggestedActions: []string{
+					"cross-reference with any AppHash divergence findings — the root cause is likely an earlier state split",
+					"compare /validators RPC output from each node at this height to confirm the full validator set diff",
+				},
+			})
+		}
+	}
+
 	// ── Clock-skew detection ─────────────────────────────────────────────────
 	// Compare timestamps of FinalizeCommit events at the same height across nodes.
 	// A large spread is a signal of clock skew, which can cause spurious timeouts.
@@ -2037,7 +2193,7 @@ func updateLastConsensusState(summary *model.NodeSummary, event model.Event) {
 // For timeout events the step field in Fields is consulted first.
 func inferStepFromEvent(event model.Event) string {
 	switch event.Kind {
-	case model.EventSignedProposal, model.EventReceivedCompletePart:
+	case model.EventSignedProposal, model.EventReceivedCompletePart, model.EventEnterPropose:
 		return "Propose"
 	case model.EventAddedPrevote, model.EventPrevoteProposalNil:
 		return "Prevote"

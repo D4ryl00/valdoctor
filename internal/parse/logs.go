@@ -435,6 +435,9 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventReceivedCompletePart
 	case strings.Contains(msg, "Signed proposal"):
 		return model.EventSignedProposal
+	case strings.Contains(msg, "enterPropose: Our turn to propose"),
+		strings.Contains(msg, "enterPropose: Not our turn to propose"):
+		return model.EventEnterPropose
 
 	// ── Execution / application layer ─────────────────────────────────────
 	// Source: tm2/pkg/bft/state/execution.go, tm2/pkg/sdk/baseapp.go
@@ -464,8 +467,6 @@ func classifyMessage(msg string) model.EventKind {
 	case strings.Contains(msg, "enterNewRound("):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "enterPropose("):
-		return model.EventKnownNoise
-	case strings.Contains(msg, "enterPropose: Not our turn to propose"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "enterPrevote: ProposalBlock is valid"):
 		return model.EventKnownNoise

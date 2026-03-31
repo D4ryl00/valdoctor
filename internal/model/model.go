@@ -95,6 +95,7 @@ const (
 	EventApplyBlockError      EventKind = "apply_block_error"
 	EventNodeNotValidator     EventKind = "node_not_validator"
 	EventSignedProposal       EventKind = "signed_proposal"
+	EventEnterPropose         EventKind = "enter_propose"
 	EventRemoteSignerFailure  EventKind = "remote_signer_failure"
 	EventRemoteSignerConnect  EventKind = "remote_signer_connected"
 	EventReceivedCompletePart EventKind = "received_complete_proposal_block"
@@ -240,6 +241,10 @@ type NodeSummary struct {
 
 	// Proposer participation.
 	ProposalSignedCount int `json:"proposal_signed_count,omitempty"`
+
+	// Proposer address seen at each (height, round) from enterPropose log lines.
+	// Key format: "height/round" (e.g. "19497/0"). Value: bech32 proposer address.
+	ProposerByHeightRound map[string]string `json:"proposer_by_height_round,omitempty"`
 
 	// Round escalation: highest round reached at any single height.
 	MaxRoundSeen   int   `json:"max_round_seen,omitempty"`
