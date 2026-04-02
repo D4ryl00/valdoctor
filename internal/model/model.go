@@ -173,6 +173,32 @@ type Finding struct {
 	SuggestedActions []string   `json:"suggested_actions,omitempty"`
 }
 
+// StallConsensusState captures the consensus state at the height where a node
+// stopped making forward progress. Built from log events (Source=="logs") or
+// the /consensus_state RPC endpoint (Source=="rpc").
+type StallConsensusState struct {
+	Source string `json:"source"` // "logs" or "rpc"
+	Height int64  `json:"height"`
+	Round  int    `json:"round"`
+	Step   string `json:"step,omitempty"`
+
+	// Proposal
+	Proposer          string `json:"proposer,omitempty"`
+	ProposalSigned    bool   `json:"proposal_signed,omitempty"`
+	ProposalReceived  bool   `json:"proposal_received,omitempty"`
+	ProposalBlockHash string `json:"proposal_block_hash,omitempty"`
+	LockedBlockHash   string `json:"locked_block_hash,omitempty"`
+
+	// Votes at this height/round (from VoteSet logs or RPC bit arrays)
+	PrevotesReceived   int  `json:"prevotes_received,omitempty"`
+	PrevotesTotal      int  `json:"prevotes_total,omitempty"`
+	PrevotesMaj23      bool `json:"prevotes_maj23,omitempty"`
+	PrecommitsReceived int  `json:"precommits_received,omitempty"`
+	PrecommitsTotal    int  `json:"precommits_total,omitempty"`
+	PrecommitsMaj23    bool `json:"precommits_maj23,omitempty"`
+	NilPrevoteCount    int  `json:"nil_prevote_count,omitempty"`
+}
+
 // PeerRoundState is the last-known consensus state of a remote peer,
 // inferred from [NewRoundStep ...] gossip messages in this node's log.
 type PeerRoundState struct {
@@ -245,6 +271,10 @@ type NodeSummary struct {
 	// Proposer address seen at each (height, round) from enterPropose log lines.
 	// Key format: "height/round" (e.g. "19497/0"). Value: bech32 proposer address.
 	ProposerByHeightRound map[string]string `json:"proposer_by_height_round,omitempty"`
+
+	// StallState is the consensus state at the height where this node stopped
+	// making forward progress, or nil if the node committed normally.
+	StallState *StallConsensusState `json:"stall_state,omitempty"`
 
 	// Round escalation: highest round reached at any single height.
 	MaxRoundSeen   int   `json:"max_round_seen,omitempty"`

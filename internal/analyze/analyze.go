@@ -244,6 +244,15 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 				maxRoundByNode[event.Node][event.Height] = event.Round
 			}
 		}
+
+		updateStallState(summary, event)
+	}
+
+	// Clear stall state for any height that ended up committed.
+	for _, summary := range summaries {
+		if summary.StallState != nil && summary.StallState.Height <= summary.HighestCommit {
+			summary.StallState = nil
+		}
 	}
 
 	// Second pass: compute derived timing fields now that all events are consumed.
@@ -2087,6 +2096,88 @@ func timeBounds(events []model.Event) (time.Time, time.Time) {
 		}
 	}
 	return start, end
+}
+
+// updateStallState maintains summary.StallState for events at the current stall
+// height (any height above the highest committed block seen so far).
+func updateStallState(summary *model.NodeSummary, event model.Event) {
+	if event.Height <= 0 || event.Height <= summary.HighestCommit {
+		return
+	}
+	ss := summary.StallState
+	// Initialize or advance to a higher height.
+	if ss == nil || event.Height > ss.Height {
+		ss = &model.StallConsensusState{
+			Source: "logs",
+			Height: event.Height,
+			Round:  event.Round,
+		}
+		summary.StallState = ss
+	}
+	// Advance to a higher round at the same height — reset round-specific counters.
+	if event.Height == ss.Height && event.Round > ss.Round {
+		ss.Round = event.Round
+		ss.ProposalReceived = false
+		ss.ProposalSigned = false
+		ss.ProposalBlockHash = ""
+		ss.NilPrevoteCount = 0
+		ss.PrevotesReceived, ss.PrevotesTotal, ss.PrevotesMaj23 = 0, 0, false
+		ss.PrecommitsReceived, ss.PrecommitsTotal, ss.PrecommitsMaj23 = 0, 0, false
+	}
+	// Only process events that match the current stall height/round.
+	if event.Height != ss.Height {
+		return
+	}
+	// Advance step to the furthest one seen.
+	if step := inferStepFromEvent(event); step != "" && stallStepRank(step) > stallStepRank(ss.Step) {
+		ss.Step = step
+	}
+	switch event.Kind {
+	case model.EventEnterPropose:
+		if addr, ok := event.Fields["proposer"].(string); ok && addr != "" {
+			ss.Proposer = addr
+		}
+	case model.EventSignedProposal:
+		ss.ProposalSigned = true
+	case model.EventReceivedCompletePart:
+		ss.ProposalReceived = true
+	case model.EventAddedPrevote:
+		if total, ok := event.Fields["_vtotal"].(int); ok && total > 0 && event.Round == ss.Round {
+			ss.PrevotesReceived, _ = event.Fields["_vrecv"].(int)
+			ss.PrevotesTotal = total
+			ss.PrevotesMaj23, _ = event.Fields["_vmaj23"].(bool)
+		}
+	case model.EventAddedPrecommit:
+		if total, ok := event.Fields["_vtotal"].(int); ok && total > 0 && event.Round == ss.Round {
+			ss.PrecommitsReceived, _ = event.Fields["_vrecv"].(int)
+			ss.PrecommitsTotal = total
+			ss.PrecommitsMaj23, _ = event.Fields["_vmaj23"].(bool)
+		}
+	case model.EventPrevoteProposalNil:
+		ss.NilPrevoteCount++
+	}
+}
+
+func stallStepRank(step string) int {
+	switch step {
+	case "NewHeight":
+		return 1
+	case "NewRound":
+		return 2
+	case "Propose":
+		return 3
+	case "Prevote":
+		return 4
+	case "PrevoteWait":
+		return 5
+	case "Precommit":
+		return 6
+	case "PrecommitWait":
+		return 7
+	case "Commit":
+		return 8
+	}
+	return 0
 }
 
 func severityRank(severity model.Severity) int {

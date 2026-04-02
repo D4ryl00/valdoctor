@@ -55,6 +55,120 @@ func FetchBlockResults(endpoint string, height int64) (BlockResults, error) {
 	return parseBlockResults(body, height)
 }
 
+// ConsensusState holds the parsed fields from the /consensus_state response.
+type ConsensusState struct {
+	Height int64  `json:"height"`
+	Round  int    `json:"round"`
+	Step   string `json:"step"` // e.g. "Prevote", "Precommit"
+
+	ProposalBlockHash string `json:"proposal_block_hash,omitempty"`
+	LockedBlockHash   string `json:"locked_block_hash,omitempty"`
+
+	PrevotesReceived   int  `json:"prevotes_received,omitempty"`
+	PrevotesTotal      int  `json:"prevotes_total,omitempty"`
+	PrevotesMaj23      bool `json:"prevotes_maj23,omitempty"`
+	PrecommitsReceived int  `json:"precommits_received,omitempty"`
+	PrecommitsTotal    int  `json:"precommits_total,omitempty"`
+	PrecommitsMaj23    bool `json:"precommits_maj23,omitempty"`
+}
+
+// FetchConsensusState calls <endpoint>/consensus_state and returns the parsed response.
+func FetchConsensusState(endpoint string) (ConsensusState, error) {
+	url := strings.TrimRight(endpoint, "/") + "/consensus_state"
+	body, err := get(url)
+	if err != nil {
+		return ConsensusState{}, err
+	}
+	return parseConsensusState(body)
+}
+
+func parseConsensusState(data []byte) (ConsensusState, error) {
+	var envelope struct {
+		Result struct {
+			RoundState struct {
+				HRS               string `json:"height/round/step"`
+				ProposalBlockHash string `json:"proposal_block_hash"`
+				LockedBlockHash   string `json:"locked_block_hash"`
+				HeightVoteSet     []struct {
+					Round              int    `json:"round"`
+					PrevotesBitArray   string `json:"prevotes_bit_array"`
+					PrecommitsBitArray string `json:"precommits_bit_array"`
+				} `json:"height_vote_set"`
+			} `json:"round_state"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return ConsensusState{}, fmt.Errorf("unmarshal consensus_state: %w", err)
+	}
+	rs := envelope.Result.RoundState
+	cs := ConsensusState{
+		ProposalBlockHash: rs.ProposalBlockHash,
+		LockedBlockHash:   rs.LockedBlockHash,
+	}
+	var stepNum int
+	fmt.Sscanf(rs.HRS, "%d/%d/%d", &cs.Height, &cs.Round, &stepNum)
+	cs.Step = roundStepName(stepNum)
+
+	// Extract vote counts for the current round from the bit arrays.
+	for _, rvs := range rs.HeightVoteSet {
+		if rvs.Round != cs.Round {
+			continue
+		}
+		cs.PrevotesReceived, cs.PrevotesTotal, cs.PrevotesMaj23 = parseBitArray(rvs.PrevotesBitArray)
+		cs.PrecommitsReceived, cs.PrecommitsTotal, cs.PrecommitsMaj23 = parseBitArray(rvs.PrecommitsBitArray)
+		break
+	}
+	return cs, nil
+}
+
+// roundStepName maps a TM2 RoundStepType integer to its short name.
+func roundStepName(step int) string {
+	switch step {
+	case 1:
+		return "NewHeight"
+	case 2:
+		return "NewRound"
+	case 3:
+		return "Propose"
+	case 4:
+		return "Prevote"
+	case 5:
+		return "PrevoteWait"
+	case 6:
+		return "Precommit"
+	case 7:
+		return "PrecommitWait"
+	case 8:
+		return "Commit"
+	}
+	return fmt.Sprintf("Step%d", step)
+}
+
+// parseBitArray extracts vote counts from a TM2 bit-array string.
+// Format: "BA{N:xxx___} M/T = F" — N slots, x=voted, _=not voted.
+// Returns the number of 'x' bits, total slots, and whether the fraction > 2/3.
+func parseBitArray(s string) (received, total int, maj23 bool) {
+	start := strings.Index(s, ":")
+	end := strings.Index(s, "}")
+	if start < 0 || end < 0 || end <= start {
+		return
+	}
+	bits := s[start+1 : end]
+	total = len(bits)
+	for _, c := range bits {
+		if c == 'x' {
+			received++
+		}
+	}
+	// Parse the power fraction "M/T = F" to determine +2/3.
+	if eqIdx := strings.Index(s, "= "); eqIdx >= 0 {
+		var f float64
+		fmt.Sscanf(s[eqIdx+2:], "%f", &f)
+		maj23 = f > 0.6667
+	}
+	return
+}
+
 func get(url string) ([]byte, error) {
 	resp, err := httpClient.Get(url)
 	if err != nil {

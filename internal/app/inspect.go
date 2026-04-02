@@ -557,57 +557,185 @@ func openPager() (io.Writer, func()) {
 // evidence items on the finding so the operator can immediately see which
 // transaction produced different gas/state across validators.
 func enrichWithRPC(report *model.Report, meta model.Metadata) {
-	// Collect nodes with RPC endpoints.
+	// Collect all nodes that have an RPC endpoint configured.
 	type rpcNode struct {
 		name     string
 		endpoint string
+		hasLogs  bool // true if a NodeSummary was built from logs for this node
+	}
+	loggedNodes := map[string]bool{}
+	for _, ns := range report.Nodes {
+		loggedNodes[ns.Name] = true
 	}
 	var rpcNodes []rpcNode
 	for name, node := range meta.Nodes {
-		if node.RPCEndpoint != "" {
-			rpcNodes = append(rpcNodes, rpcNode{name: name, endpoint: node.RPCEndpoint})
+		if node.RPCEndpoint == "" {
+			continue
 		}
+		rpcNodes = append(rpcNodes, rpcNode{
+			name:     name,
+			endpoint: node.RPCEndpoint,
+			hasLogs:  loggedNodes[name],
+		})
 	}
 	if len(rpcNodes) == 0 {
 		return
 	}
+	sort.Slice(rpcNodes, func(i, j int) bool { return rpcNodes[i].name < rpcNodes[j].name })
 
+	// Phase 1: probe every RPC node for its live status (height + AppHash) and
+	// current consensus round state.
+	type nodeStatus struct {
+		rpcNode
+		info      rpc.ABCIInfo
+		csState   rpc.ConsensusState
+		csErr     error
+		infoErr   error
+	}
+	statuses := make([]nodeStatus, len(rpcNodes))
+	for i, n := range rpcNodes {
+		info, infoErr := rpc.FetchABCIInfo(n.endpoint)
+		csState, csErr := rpc.FetchConsensusState(n.endpoint)
+		statuses[i] = nodeStatus{n, info, csState, csErr, infoErr}
+	}
+
+	// Build a name→index map for fast lookup into report.Nodes.
+	nodeIndex := map[string]int{}
+	for i, ns := range report.Nodes {
+		nodeIndex[ns.Name] = i
+	}
+
+	// Populate StallState from RPC for all nodes that have a consensus state.
+	for _, s := range statuses {
+		if s.csErr != nil {
+			continue
+		}
+		stallFromRPC := &model.StallConsensusState{
+			Source:             "rpc",
+			Height:             s.csState.Height,
+			Round:              s.csState.Round,
+			Step:               s.csState.Step,
+			ProposalBlockHash:  s.csState.ProposalBlockHash,
+			LockedBlockHash:    s.csState.LockedBlockHash,
+			PrevotesReceived:   s.csState.PrevotesReceived,
+			PrevotesTotal:      s.csState.PrevotesTotal,
+			PrevotesMaj23:      s.csState.PrevotesMaj23,
+			PrecommitsReceived: s.csState.PrecommitsReceived,
+			PrecommitsTotal:    s.csState.PrecommitsTotal,
+			PrecommitsMaj23:    s.csState.PrecommitsMaj23,
+		}
+		if idx, ok := nodeIndex[s.name]; ok {
+			// Node has logs: only adopt RPC stall state if logs had none,
+			// or if RPC shows a more advanced height.
+			existing := report.Nodes[idx].StallState
+			if existing == nil || stallFromRPC.Height > existing.Height {
+				report.Nodes[idx].StallState = stallFromRPC
+			} else if stallFromRPC.Height == existing.Height {
+				// Merge: fill in proposal hashes that logs don't carry.
+				if existing.ProposalBlockHash == "" {
+					existing.ProposalBlockHash = stallFromRPC.ProposalBlockHash
+				}
+				if existing.LockedBlockHash == "" {
+					existing.LockedBlockHash = stallFromRPC.LockedBlockHash
+				}
+			}
+		} else {
+			// RPC-only node: create a minimal NodeSummary so it appears in the
+			// stall comparison table.
+			role := model.RoleValidator
+			if mn, ok := meta.Nodes[s.name]; ok {
+				role = model.Role(mn.Role)
+			}
+			report.Nodes = append(report.Nodes, model.NodeSummary{
+				Name:       s.name,
+				Role:       role,
+				StallState: stallFromRPC,
+			})
+		}
+	}
+
+	// Phase 2: report live status for RPC-only nodes (no logs were provided for them).
+	var rpcOnlyEvidence []model.Evidence
+	for _, s := range statuses {
+		if s.hasLogs {
+			continue
+		}
+		if s.infoErr != nil {
+			rpcOnlyEvidence = append(rpcOnlyEvidence, model.Evidence{
+				Node:    s.name,
+				Message: fmt.Sprintf("RPC unreachable: %v", s.infoErr),
+			})
+		} else {
+			rpcOnlyEvidence = append(rpcOnlyEvidence, model.Evidence{
+				Node:    s.name,
+				Message: fmt.Sprintf("height=%d app_hash=%s", s.info.LastBlockHeight, s.info.LastBlockAppHash),
+			})
+		}
+	}
+	if len(rpcOnlyEvidence) > 0 {
+		report.Findings = append(report.Findings, model.Finding{
+			ID:         "rpc-node-live-status",
+			Title:      "Live status of validators without logs",
+			Severity:   model.SeverityInfo,
+			Confidence: model.ConfidenceHigh,
+			Scope:      "global",
+			Summary:    "These validators were not included in the analyzed logs. Their current height and AppHash were fetched via RPC.",
+			Evidence:   rpcOnlyEvidence,
+			SuggestedActions: []string{
+				"collect logs from these nodes and re-run to get a complete picture",
+				"cross-reference their AppHash with the apphash-divergence finding to see whether they are on the correct branch",
+			},
+		})
+	}
+
+	// Phase 3: enrich the apphash-divergence finding with live ABCI info and
+	// block_results at the divergence height from all reachable RPC nodes.
 	for i, finding := range report.Findings {
 		if finding.ID != "apphash-divergence" {
 			continue
 		}
-		// Parse the divergence height from the finding title ("... at height N").
-		var height int64
-		fmt.Sscanf(finding.Title, "AppHash divergence between validators at height %d", &height)
-		if height <= 0 {
-			continue
-		}
+		var divergenceHeight int64
+		fmt.Sscanf(finding.Title, "AppHash divergence between validators at height %d", &divergenceHeight)
 
-		// Fetch block_results from all configured RPC nodes.
-		for _, node := range rpcNodes {
-			br, err := rpc.FetchBlockResults(node.endpoint, height)
+		for _, s := range statuses {
+			if s.infoErr != nil {
+				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
+					Node:    s.name,
+					Message: fmt.Sprintf("RPC unreachable: %v", s.infoErr),
+				})
+				continue
+			}
+			report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
+				Node:    s.name,
+				Message: fmt.Sprintf("live state: height=%d app_hash=%s", s.info.LastBlockHeight, s.info.LastBlockAppHash),
+			})
+
+			if divergenceHeight <= 0 {
+				continue
+			}
+			br, err := rpc.FetchBlockResults(s.endpoint, divergenceHeight)
 			if err != nil {
 				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
-					Node:    node.name,
-					Message: fmt.Sprintf("RPC block_results fetch failed: %v", err),
+					Node:    s.name,
+					Message: fmt.Sprintf("block_results h%d: fetch failed: %v", divergenceHeight, err),
 				})
 				continue
 			}
 			if len(br.DeliverTxs) == 0 {
 				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
-					Node:    node.name,
-					Message: fmt.Sprintf("block_results h%d: no transactions", height),
+					Node:    s.name,
+					Message: fmt.Sprintf("block_results h%d: no transactions", divergenceHeight),
 				})
 				continue
 			}
 			for idx, tx := range br.DeliverTxs {
 				msg := fmt.Sprintf("block_results h%d tx[%d]: gas_wanted=%d gas_used=%d",
-					height, idx, tx.GasWanted, tx.GasUsed)
+					divergenceHeight, idx, tx.GasWanted, tx.GasUsed)
 				if tx.Error != "" {
 					msg += " error=" + tx.Error
 				}
 				report.Findings[i].Evidence = append(report.Findings[i].Evidence, model.Evidence{
-					Node:    node.name,
+					Node:    s.name,
 					Message: msg,
 				})
 			}

@@ -262,6 +262,156 @@ func Text(report model.Report, opts TextOptions) string {
 		}
 	}
 
+	// ── Consensus stall state ────────────────────────────────────────────────
+	// Per-node pipeline view (Propose → Prevote → Precommit → Commit) shown
+	// whenever any node has a StallState. Discrepancies across nodes are
+	// highlighted in red.
+	{
+		var stallNodes []model.NodeSummary
+		for _, node := range report.Nodes {
+			if node.StallState != nil {
+				stallNodes = append(stallNodes, node)
+			}
+		}
+		if len(stallNodes) > 0 {
+			b.WriteString("\n" + c.bold("Consensus stall state") + "\n")
+
+			// Detect cross-node discrepancies for highlighting.
+			heights := map[int64]bool{}
+			rounds := map[int]bool{}
+			proposers := map[string]bool{}
+			for _, node := range stallNodes {
+				ss := node.StallState
+				heights[ss.Height] = true
+				rounds[ss.Round] = true
+				if ss.Proposer != "" {
+					proposers[ss.Proposer] = true
+				}
+			}
+			multiHeight := len(heights) > 1
+			multiRound := len(rounds) > 1
+			multiProposer := len(proposers) > 1
+
+			for _, node := range stallNodes {
+				ss := node.StallState
+
+				// Header line.
+				hStr := fmt.Sprintf("h=%d", ss.Height)
+				if multiHeight {
+					hStr = c.red(hStr)
+				}
+				rStr := fmt.Sprintf("r=%d", ss.Round)
+				if multiRound {
+					rStr = c.red(rStr)
+				}
+				fmt.Fprintf(&b, "- %s %s  %s %s\n",
+					node.Name, c.dim("["+ss.Source+"]"), hStr, rStr)
+
+				// Proposer.
+				if ss.Proposer != "" {
+					short := ss.Proposer
+					if len(short) > 20 {
+						short = short[:10] + "…" + short[len(short)-8:]
+					}
+					label := "  proposer:  "
+					val := c.dim(short)
+					if multiProposer {
+						val = c.red(short + "  ← mismatch")
+					}
+					fmt.Fprintf(&b, "%s%s\n", label, val)
+				}
+
+				rank := stallStepRank(ss.Step)
+
+				// ── Propose step ──────────────────────────────────────────
+				proposeReached := rank >= stallStepRank("Propose")
+				fmt.Fprintf(&b, "  Propose:    ")
+				if !proposeReached {
+					fmt.Fprintf(&b, "%s\n", c.dim("not reached"))
+				} else {
+					parts := []string{}
+					if ss.ProposalSigned {
+						parts = append(parts, c.green("signed"))
+					}
+					if ss.ProposalReceived {
+						parts = append(parts, c.green("received"))
+					}
+					if ss.NilPrevoteCount > 0 {
+						parts = append(parts, c.red(fmt.Sprintf("no proposal (%dx nil-prevote)", ss.NilPrevoteCount)))
+					}
+					if ss.ProposalBlockHash != "" {
+						short := ss.ProposalBlockHash
+						if len(short) > 16 {
+							short = short[:16] + "…"
+						}
+						parts = append(parts, c.dim("block="+short))
+					}
+					if len(parts) == 0 {
+						parts = append(parts, c.dim("reached"))
+					}
+					fmt.Fprintf(&b, "%s\n", strings.Join(parts, "  "))
+				}
+
+				// ── Prevote step ──────────────────────────────────────────
+				prevoteReached := rank >= stallStepRank("Prevote")
+				fmt.Fprintf(&b, "  Prevote:    ")
+				if !prevoteReached {
+					fmt.Fprintf(&b, "%s\n", c.dim("not reached"))
+				} else if ss.PrevotesTotal == 0 {
+					suffix := ""
+					if ss.Step == "Prevote" || ss.Step == "PrevoteWait" {
+						suffix = c.yellow("  ← stuck here")
+					}
+					fmt.Fprintf(&b, "%s%s\n", c.dim("reached (no vote data)"), suffix)
+				} else {
+					maj := ""
+					if ss.PrevotesMaj23 {
+						maj = c.green(" +2/3")
+					}
+					suffix := ""
+					if ss.Step == "Prevote" || ss.Step == "PrevoteWait" {
+						suffix = c.yellow("  ← stuck here")
+					}
+					fmt.Fprintf(&b, "%d/%d%s%s\n", ss.PrevotesReceived, ss.PrevotesTotal, maj, suffix)
+				}
+
+				// ── Precommit step ────────────────────────────────────────
+				precommitReached := rank >= stallStepRank("Precommit")
+				fmt.Fprintf(&b, "  Precommit:  ")
+				if !precommitReached {
+					fmt.Fprintf(&b, "%s\n", c.dim("not reached"))
+				} else if ss.PrecommitsTotal == 0 {
+					suffix := ""
+					if ss.Step == "Precommit" || ss.Step == "PrecommitWait" {
+						suffix = c.yellow("  ← stuck here")
+					}
+					fmt.Fprintf(&b, "%s%s\n", c.dim("reached (no vote data)"), suffix)
+				} else {
+					maj := ""
+					if ss.PrecommitsMaj23 {
+						maj = c.green(" +2/3")
+					}
+					suffix := ""
+					if ss.Step == "Precommit" || ss.Step == "PrecommitWait" {
+						suffix = c.yellow("  ← stuck here")
+					}
+					fmt.Fprintf(&b, "%d/%d%s%s\n", ss.PrecommitsReceived, ss.PrecommitsTotal, maj, suffix)
+				}
+
+				// ── Commit ────────────────────────────────────────────────
+				fmt.Fprintf(&b, "  Commit:     %s\n", c.red("not committed"))
+
+				if ss.LockedBlockHash != "" {
+					short := ss.LockedBlockHash
+					if len(short) > 16 {
+						short = short[:16] + "…"
+					}
+					fmt.Fprintf(&b, "  locked:     %s\n", c.dim(short))
+				}
+			}
+		}
+	}
+
 	// ── Findings ─────────────────────────────────────────────────────────────
 	b.WriteString("\n" + c.bold("Findings") + "\n")
 	rendered := 0
@@ -321,6 +471,28 @@ func Text(report model.Report, opts TextOptions) string {
 	}
 
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func stallStepRank(step string) int {
+	switch step {
+	case "NewHeight":
+		return 1
+	case "NewRound":
+		return 2
+	case "Propose":
+		return 3
+	case "Prevote":
+		return 4
+	case "PrevoteWait":
+		return 5
+	case "Precommit":
+		return 6
+	case "PrecommitWait":
+		return 7
+	case "Commit":
+		return 8
+	}
+	return 0
 }
 
 func emptyDash(value string) string {
