@@ -31,6 +31,13 @@ type Validator struct {
 	Power   int64  `json:"power"`
 }
 
+type ValidatorSlot struct {
+	Index   int    `json:"index"`
+	Name    string `json:"name,omitempty"`
+	Address string `json:"address,omitempty"`
+	Node    string `json:"node,omitempty"`
+}
+
 type Genesis struct {
 	Path         string      `json:"path"`
 	ChainID      string      `json:"chain_id"`
@@ -65,7 +72,7 @@ type MetadataNode struct {
 	// RPCEndpoint is the base URL of this node's RPC server (e.g.
 	// "http://host:26657"). When set, valdoctor can call /block_results and
 	// /abci_info to enrich findings with live chain state.
-	RPCEndpoint      string   `toml:"rpc_endpoint,omitempty" json:"rpc_endpoint,omitempty"`
+	RPCEndpoint string `toml:"rpc_endpoint,omitempty" json:"rpc_endpoint,omitempty"`
 }
 
 type MetadataTopology struct {
@@ -75,48 +82,48 @@ type MetadataTopology struct {
 type EventKind string
 
 const (
-	EventUnknown              EventKind = "unknown"
-	EventParserWarning        EventKind = "parser_warning"
-	EventConfigError          EventKind = "config_error"
-	EventAddedPeer            EventKind = "added_peer"
-	EventStoppedPeer          EventKind = "stopping_peer"
-	EventDialFailure          EventKind = "dial_failure"
-	EventMaxOutboundPeers     EventKind = "max_outbound_peers"
-	EventNoPeersToShare       EventKind = "no_peers_to_share"
-	EventTimeout              EventKind = "timeout"
-	EventSwitchToConsensus    EventKind = "switch_to_consensus"
-	EventPrevoteProposalNil   EventKind = "prevote_proposal_nil"
-	EventPrecommitNoMaj23     EventKind = "precommit_no_maj23"
-	EventFinalizeNoMaj23      EventKind = "finalize_no_maj23"
-	EventCommitBlockMissing   EventKind = "commit_block_missing"
-	EventFinalizeCommit       EventKind = "finalize_commit"
-	EventConsensusFailure     EventKind = "consensus_failure"
-	EventConflictingVote      EventKind = "conflicting_vote"
-	EventApplyBlockError      EventKind = "apply_block_error"
-	EventNodeNotValidator     EventKind = "node_not_validator"
-	EventSignedProposal       EventKind = "signed_proposal"
-	EventEnterPropose         EventKind = "enter_propose"
-	EventRemoteSignerFailure  EventKind = "remote_signer_failure"
-	EventRemoteSignerConnect  EventKind = "remote_signer_connected"
-	EventReceivedCompletePart EventKind = "received_complete_proposal_block"
-	EventFastSyncBlockError      EventKind = "fastsync_block_validation_error"
-	EventAddedPrevote            EventKind = "added_prevote"
-	EventAddedPrecommit          EventKind = "added_precommit"
-	EventCommitUnknownBlock      EventKind = "commit_unknown_block"
-	EventCommitLockedBlock       EventKind = "commit_locked_block"
-	EventUnexpectedBlockPart     EventKind = "unexpected_block_part"
-	EventAddVoteError            EventKind = "add_vote_error"
-	EventCommittedState          EventKind = "committed_state"
-	EventExecutedBlock           EventKind = "executed_block"
-	EventCommitSynced            EventKind = "commit_synced"
-	EventFastSyncRate            EventKind = "fast_sync_rate"
-	EventNodeIsValidator         EventKind = "node_is_validator"
-	EventRemoteSignerSuccess     EventKind = "remote_signer_success"
-	EventPrevoteProposalInvalid  EventKind = "prevote_proposal_invalid"
+	EventUnknown                EventKind = "unknown"
+	EventParserWarning          EventKind = "parser_warning"
+	EventConfigError            EventKind = "config_error"
+	EventAddedPeer              EventKind = "added_peer"
+	EventStoppedPeer            EventKind = "stopping_peer"
+	EventDialFailure            EventKind = "dial_failure"
+	EventMaxOutboundPeers       EventKind = "max_outbound_peers"
+	EventNoPeersToShare         EventKind = "no_peers_to_share"
+	EventTimeout                EventKind = "timeout"
+	EventSwitchToConsensus      EventKind = "switch_to_consensus"
+	EventPrevoteProposalNil     EventKind = "prevote_proposal_nil"
+	EventPrecommitNoMaj23       EventKind = "precommit_no_maj23"
+	EventFinalizeNoMaj23        EventKind = "finalize_no_maj23"
+	EventCommitBlockMissing     EventKind = "commit_block_missing"
+	EventFinalizeCommit         EventKind = "finalize_commit"
+	EventConsensusFailure       EventKind = "consensus_failure"
+	EventConflictingVote        EventKind = "conflicting_vote"
+	EventApplyBlockError        EventKind = "apply_block_error"
+	EventNodeNotValidator       EventKind = "node_not_validator"
+	EventSignedProposal         EventKind = "signed_proposal"
+	EventEnterPropose           EventKind = "enter_propose"
+	EventRemoteSignerFailure    EventKind = "remote_signer_failure"
+	EventRemoteSignerConnect    EventKind = "remote_signer_connected"
+	EventReceivedCompletePart   EventKind = "received_complete_proposal_block"
+	EventFastSyncBlockError     EventKind = "fastsync_block_validation_error"
+	EventAddedPrevote           EventKind = "added_prevote"
+	EventAddedPrecommit         EventKind = "added_precommit"
+	EventCommitUnknownBlock     EventKind = "commit_unknown_block"
+	EventCommitLockedBlock      EventKind = "commit_locked_block"
+	EventUnexpectedBlockPart    EventKind = "unexpected_block_part"
+	EventAddVoteError           EventKind = "add_vote_error"
+	EventCommittedState         EventKind = "committed_state"
+	EventExecutedBlock          EventKind = "executed_block"
+	EventCommitSynced           EventKind = "commit_synced"
+	EventFastSyncRate           EventKind = "fast_sync_rate"
+	EventNodeIsValidator        EventKind = "node_is_validator"
+	EventRemoteSignerSuccess    EventKind = "remote_signer_success"
+	EventPrevoteProposalInvalid EventKind = "prevote_proposal_invalid"
 	// EventKnownNoise marks messages that are recognised from the gno source
 	// but carry no diagnostic value. They are dropped immediately — not stored
 	// and not counted in the unclassified frequency table.
-	EventKnownNoise              EventKind = "known_noise"
+	EventKnownNoise EventKind = "known_noise"
 )
 
 type Event struct {
@@ -190,13 +197,15 @@ type StallConsensusState struct {
 	LockedBlockHash   string `json:"locked_block_hash,omitempty"`
 
 	// Votes at this height/round (from VoteSet logs or RPC bit arrays)
-	PrevotesReceived   int  `json:"prevotes_received,omitempty"`
-	PrevotesTotal      int  `json:"prevotes_total,omitempty"`
-	PrevotesMaj23      bool `json:"prevotes_maj23,omitempty"`
-	PrecommitsReceived int  `json:"precommits_received,omitempty"`
-	PrecommitsTotal    int  `json:"precommits_total,omitempty"`
-	PrecommitsMaj23    bool `json:"precommits_maj23,omitempty"`
-	NilPrevoteCount    int  `json:"nil_prevote_count,omitempty"`
+	PrevotesReceived   int    `json:"prevotes_received,omitempty"`
+	PrevotesTotal      int    `json:"prevotes_total,omitempty"`
+	PrevotesMaj23      bool   `json:"prevotes_maj23,omitempty"`
+	PrevotesBitArray   string `json:"prevotes_bit_array,omitempty"`
+	PrecommitsReceived int    `json:"precommits_received,omitempty"`
+	PrecommitsTotal    int    `json:"precommits_total,omitempty"`
+	PrecommitsMaj23    bool   `json:"precommits_maj23,omitempty"`
+	PrecommitsBitArray string `json:"precommits_bit_array,omitempty"`
+	NilPrevoteCount    int    `json:"nil_prevote_count,omitempty"`
 }
 
 // PeerRoundState is the last-known consensus state of a remote peer,
@@ -242,13 +251,15 @@ type NodeSummary struct {
 	MaxOutboundPeersHit int           `json:"max_outbound_peers_hit,omitempty"`
 
 	// Vote state from the most recent VoteSet debug logs (0 = not observed).
-	VoteStateHeight    int64 `json:"vote_state_height,omitempty"`
-	PrevotesReceived   int   `json:"prevotes_received,omitempty"`
-	PrevotesTotal      int   `json:"prevotes_total,omitempty"`
-	PrevotesMaj23      bool  `json:"prevotes_maj23,omitempty"`
-	PrecommitsReceived int   `json:"precommits_received,omitempty"`
-	PrecommitsTotal    int   `json:"precommits_total,omitempty"`
-	PrecommitsMaj23    bool  `json:"precommits_maj23,omitempty"`
+	VoteStateHeight    int64  `json:"vote_state_height,omitempty"`
+	PrevotesReceived   int    `json:"prevotes_received,omitempty"`
+	PrevotesTotal      int    `json:"prevotes_total,omitempty"`
+	PrevotesMaj23      bool   `json:"prevotes_maj23,omitempty"`
+	PrevotesBitArray   string `json:"prevotes_bit_array,omitempty"`
+	PrecommitsReceived int    `json:"precommits_received,omitempty"`
+	PrecommitsTotal    int    `json:"precommits_total,omitempty"`
+	PrecommitsMaj23    bool   `json:"precommits_maj23,omitempty"`
+	PrecommitsBitArray string `json:"precommits_bit_array,omitempty"`
 
 	// LastAppHash and LastAppHashHeight are the AppHash and height from the last
 	// Committed state log entry. Used to compare state across validators.
@@ -310,12 +321,13 @@ type InputSummary struct {
 }
 
 type Report struct {
-	Input                  InputSummary       `json:"input"`
-	Nodes                  []NodeSummary      `json:"nodes"`
-	Findings               []Finding          `json:"findings"`
-	Warnings               []string           `json:"warnings,omitempty"`
+	Input                  InputSummary        `json:"input"`
+	ValidatorSlots         []ValidatorSlot     `json:"validator_slots,omitempty"`
+	Nodes                  []NodeSummary       `json:"nodes"`
+	Findings               []Finding           `json:"findings"`
+	Warnings               []string            `json:"warnings,omitempty"`
 	UnclassifiedCounts     []UnclassifiedEntry `json:"unclassified_counts,omitempty"`
-	MetadataGeneratedPath  string             `json:"metadata_generated_path,omitempty"`
-	ConfidenceTooLow       bool               `json:"confidence_too_low"`
-	CriticalIssuesDetected bool               `json:"critical_issues_detected"`
+	MetadataGeneratedPath  string              `json:"metadata_generated_path,omitempty"`
+	ConfidenceTooLow       bool                `json:"confidence_too_low"`
+	CriticalIssuesDetected bool                `json:"critical_issues_detected"`
 }

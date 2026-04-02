@@ -24,14 +24,14 @@ type NodePeerStats struct {
 }
 
 type Input struct {
-	Genesis             model.Genesis
-	Sources             []model.Source
-	Events              []model.Event
-	Warnings            []string
-	UnclassifiedCounts  map[string]model.UnclassifiedEntry
-	Verbose             bool
-	Metadata            model.Metadata // optional; zero value means not provided
-	PeerStatsByNode     map[string]NodePeerStats
+	Genesis            model.Genesis
+	Sources            []model.Source
+	Events             []model.Event
+	Warnings           []string
+	UnclassifiedCounts map[string]model.UnclassifiedEntry
+	Verbose            bool
+	Metadata           model.Metadata // optional; zero value means not provided
+	PeerStatsByNode    map[string]NodePeerStats
 }
 
 func BuildReport(input Input) model.Report {
@@ -50,8 +50,9 @@ func BuildReport(input Input) model.Report {
 			TimeWindowStart: formatMaybeTime(start),
 			TimeWindowEnd:   formatMaybeTime(end),
 		},
-		Nodes:    nodes,
-		Warnings: append([]string(nil), input.Warnings...),
+		ValidatorSlots: buildValidatorSlots(input.Genesis, input.Metadata),
+		Nodes:          nodes,
+		Warnings:       append([]string(nil), input.Warnings...),
 	}
 
 	// Downgrade global finding confidence when only one node has events —
@@ -103,8 +104,47 @@ func BuildReport(input Input) model.Report {
 		report.UnclassifiedCounts = entries
 	}
 
-
 	return report
+}
+
+func buildValidatorSlots(genesis model.Genesis, meta model.Metadata) []model.ValidatorSlot {
+	if len(genesis.Validators) == 0 {
+		return nil
+	}
+
+	nodeByAddr := map[string]string{}
+	nameCounts := map[string]int{}
+	for _, node := range meta.Nodes {
+		if node.ValidatorName != "" {
+			nameCounts[node.ValidatorName]++
+		}
+	}
+	nodeByUniqueName := map[string]string{}
+	for nodeName, node := range meta.Nodes {
+		if node.ValidatorAddress != "" {
+			nodeByAddr[node.ValidatorAddress] = nodeName
+			continue
+		}
+		if node.ValidatorName != "" && nameCounts[node.ValidatorName] == 1 {
+			nodeByUniqueName[node.ValidatorName] = nodeName
+		}
+	}
+
+	slots := make([]model.ValidatorSlot, 0, len(genesis.Validators))
+	for i, validator := range genesis.Validators {
+		slot := model.ValidatorSlot{
+			Index:   i + 1,
+			Name:    validator.Name,
+			Address: validator.Address,
+		}
+		if nodeName, ok := nodeByAddr[validator.Address]; ok {
+			slot.Node = nodeName
+		} else if validator.Name != "" {
+			slot.Node = nodeByUniqueName[validator.Name]
+		}
+		slots = append(slots, slot)
+	}
+	return slots
 }
 
 func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsByNode map[string]NodePeerStats) []model.NodeSummary {
@@ -204,6 +244,7 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 				summary.PrevotesReceived, _ = event.Fields["_vrecv"].(int)
 				summary.PrevotesTotal = total
 				summary.PrevotesMaj23, _ = event.Fields["_vmaj23"].(bool)
+				summary.PrevotesBitArray, _ = event.Fields["_vbits"].(string)
 				if event.Height >= summary.VoteStateHeight {
 					summary.VoteStateHeight = event.Height
 				}
@@ -213,6 +254,7 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 				summary.PrecommitsReceived, _ = event.Fields["_vrecv"].(int)
 				summary.PrecommitsTotal = total
 				summary.PrecommitsMaj23, _ = event.Fields["_vmaj23"].(bool)
+				summary.PrecommitsBitArray, _ = event.Fields["_vbits"].(string)
 				if event.Height >= summary.VoteStateHeight {
 					summary.VoteStateHeight = event.Height
 				}
@@ -2146,12 +2188,14 @@ func updateStallState(summary *model.NodeSummary, event model.Event) {
 			ss.PrevotesReceived, _ = event.Fields["_vrecv"].(int)
 			ss.PrevotesTotal = total
 			ss.PrevotesMaj23, _ = event.Fields["_vmaj23"].(bool)
+			ss.PrevotesBitArray, _ = event.Fields["_vbits"].(string)
 		}
 	case model.EventAddedPrecommit:
 		if total, ok := event.Fields["_vtotal"].(int); ok && total > 0 && event.Round == ss.Round {
 			ss.PrecommitsReceived, _ = event.Fields["_vrecv"].(int)
 			ss.PrecommitsTotal = total
 			ss.PrecommitsMaj23, _ = event.Fields["_vmaj23"].(bool)
+			ss.PrecommitsBitArray, _ = event.Fields["_vbits"].(string)
 		}
 	case model.EventPrevoteProposalNil:
 		ss.NilPrevoteCount++

@@ -23,17 +23,17 @@ var (
 	// hexSeqRE matches hex strings that contain at least one letter (a-f/A-F),
 	// ensuring pure digit sequences always fall through to digitSeqRE instead.
 	// The alternation covers letter-first and letter-last with 8+ total chars.
-	hexSeqRE          = regexp.MustCompile(`[0-9A-Fa-f]*[A-Fa-f][0-9A-Fa-f]{7,}|[0-9A-Fa-f]{7,}[A-Fa-f][0-9A-Fa-f]*`)
-	bitArrayRE        = regexp.MustCompile(`BA\{[^}]*\}`)
+	hexSeqRE   = regexp.MustCompile(`[0-9A-Fa-f]*[A-Fa-f][0-9A-Fa-f]{7,}|[0-9A-Fa-f]{7,}[A-Fa-f][0-9A-Fa-f]*`)
+	bitArrayRE = regexp.MustCompile(`BA\{[^}]*\}`)
 	// timestampRE matches ISO 8601 timestamps so they are collapsed before hex/digit rules run.
-	timestampRE       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z`)
-	whitespaceRE      = regexp.MustCompile(`\s+`)
+	timestampRE  = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z`)
+	whitespaceRE = regexp.MustCompile(`\s+`)
 
 	// Regexes for extracting peer gossip state (vote messages and round-step updates).
 	// peerVoteRE extracts block height from [Vote Vote{VI:ADDR HEIGHT/ROUND/TYPE ...}].
 	peerVoteRE = regexp.MustCompile(`\[Vote Vote\{\d+:[0-9A-Fa-f]+ (\d+)/`)
 	// peerNRSRE extracts height, round, step from [NewRoundStep H:X R:Y S:Z ...].
-	peerNRSRE  = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
+	peerNRSRE = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
 	// peerAddrRE extracts the bech32 peer address from "Peer{MConn{...} g1xxx in/out}".
 	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
 )
@@ -686,11 +686,12 @@ func enrichEvent(event *model.Event) {
 			fieldName = "precommits"
 		}
 		if vs, ok := event.Fields[fieldName].(string); ok {
-			recv, total, maj23 := parseVoteSet(vs)
+			recv, total, maj23, bits := parseVoteSet(vs)
 			if total > 0 {
 				event.Fields["_vrecv"] = recv
 				event.Fields["_vtotal"] = total
 				event.Fields["_vmaj23"] = maj23
+				event.Fields["_vbits"] = bits
 			}
 		}
 	}
@@ -699,7 +700,7 @@ func enrichEvent(event *model.Event) {
 // parseVoteSet extracts vote counts from a TM2 VoteSet string.
 // Format: VoteSet{H:19497 R:0 T:2 +2/3:<nil>(0.571) BA{7:x______} map[]}
 // Returns received (count of 'x'), total validators, and whether +2/3 majority was reached.
-func parseVoteSet(s string) (received, total int, maj23 bool) {
+func parseVoteSet(s string) (received, total int, maj23 bool, bits string) {
 	m := voteSetRE.FindStringSubmatch(s)
 	if m == nil {
 		return
@@ -707,7 +708,8 @@ func parseVoteSet(s string) (received, total int, maj23 bool) {
 	// m[1] = "<nil>" or block hash, m[2] = total count, m[3] = bit array string
 	maj23 = m[1] != "<nil>"
 	total, _ = strconv.Atoi(m[2])
-	for _, c := range m[3] {
+	bits = m[3]
+	for _, c := range bits {
 		if c == 'x' {
 			received++
 		}

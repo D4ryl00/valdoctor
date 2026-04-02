@@ -72,6 +72,7 @@ func TestMergeMetadataMergesNodeFields(t *testing.T) {
 			Nodes: map[string]model.MetadataNode{
 				"validator_1": {
 					ValidatorAddress: "g1example",
+					RPCEndpoint:      "http://validator.example.com:26657",
 				},
 			},
 		},
@@ -80,4 +81,5 @@ func TestMergeMetadataMergesNodeFields(t *testing.T) {
 	require.Equal(t, "validator", merged.Nodes["validator_1"].Role)
 	require.Equal(t, []string{"/tmp/validator.log"}, merged.Nodes["validator_1"].Files)
 	require.Equal(t, "g1example", merged.Nodes["validator_1"].ValidatorAddress)
+	require.Equal(t, "http://validator.example.com:26657", merged.Nodes["validator_1"].RPCEndpoint)
 }

@@ -587,10 +587,10 @@ func enrichWithRPC(report *model.Report, meta model.Metadata) {
 	// current consensus round state.
 	type nodeStatus struct {
 		rpcNode
-		info      rpc.ABCIInfo
-		csState   rpc.ConsensusState
-		csErr     error
-		infoErr   error
+		info    rpc.ABCIInfo
+		csState rpc.ConsensusState
+		csErr   error
+		infoErr error
 	}
 	statuses := make([]nodeStatus, len(rpcNodes))
 	for i, n := range rpcNodes {
@@ -620,11 +620,15 @@ func enrichWithRPC(report *model.Report, meta model.Metadata) {
 			PrevotesReceived:   s.csState.PrevotesReceived,
 			PrevotesTotal:      s.csState.PrevotesTotal,
 			PrevotesMaj23:      s.csState.PrevotesMaj23,
+			PrevotesBitArray:   s.csState.PrevotesBitArray,
 			PrecommitsReceived: s.csState.PrecommitsReceived,
 			PrecommitsTotal:    s.csState.PrecommitsTotal,
 			PrecommitsMaj23:    s.csState.PrecommitsMaj23,
+			PrecommitsBitArray: s.csState.PrecommitsBitArray,
 		}
 		if idx, ok := nodeIndex[s.name]; ok {
+			updateNodeConsensusFromRPC(&report.Nodes[idx], s.csState)
+
 			// Node has logs: only adopt RPC stall state if logs had none,
 			// or if RPC shows a more advanced height.
 			existing := report.Nodes[idx].StallState
@@ -641,18 +645,24 @@ func enrichWithRPC(report *model.Report, meta model.Metadata) {
 			}
 		} else {
 			// RPC-only node: create a minimal NodeSummary so it appears in the
-			// stall comparison table.
+			// consensus and stall comparison tables.
 			role := model.RoleValidator
 			if mn, ok := meta.Nodes[s.name]; ok {
-				role = model.Role(mn.Role)
+				role = model.ParseRole(mn.Role)
 			}
-			report.Nodes = append(report.Nodes, model.NodeSummary{
+			summary := model.NodeSummary{
 				Name:       s.name,
 				Role:       role,
 				StallState: stallFromRPC,
-			})
+			}
+			updateNodeConsensusFromRPC(&summary, s.csState)
+			report.Nodes = append(report.Nodes, summary)
 		}
 	}
+
+	sort.Slice(report.Nodes, func(i, j int) bool {
+		return report.Nodes[i].Name < report.Nodes[j].Name
+	})
 
 	// Phase 2: report live status for RPC-only nodes (no logs were provided for them).
 	var rpcOnlyEvidence []model.Evidence
@@ -740,6 +750,32 @@ func enrichWithRPC(report *model.Report, meta model.Metadata) {
 				})
 			}
 		}
+	}
+}
+
+func updateNodeConsensusFromRPC(node *model.NodeSummary, cs rpc.ConsensusState) {
+	advance := cs.Height > node.LastHeight ||
+		(cs.Height == node.LastHeight && cs.Round > node.LastRound) ||
+		(cs.Height == node.LastHeight && cs.Round == node.LastRound && cs.Step != "" && node.LastStep == "")
+
+	if !advance {
+		return
+	}
+	node.LastHeight = cs.Height
+	node.LastRound = cs.Round
+	if cs.Step != "" {
+		node.LastStep = cs.Step
+	}
+	if cs.Height >= node.VoteStateHeight {
+		node.VoteStateHeight = cs.Height
+		node.PrevotesReceived = cs.PrevotesReceived
+		node.PrevotesTotal = cs.PrevotesTotal
+		node.PrevotesMaj23 = cs.PrevotesMaj23
+		node.PrevotesBitArray = cs.PrevotesBitArray
+		node.PrecommitsReceived = cs.PrecommitsReceived
+		node.PrecommitsTotal = cs.PrecommitsTotal
+		node.PrecommitsMaj23 = cs.PrecommitsMaj23
+		node.PrecommitsBitArray = cs.PrecommitsBitArray
 	}
 }
 

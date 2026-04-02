@@ -32,3 +32,12 @@ func TestParseConsoleLineWithANSIAndContainerPrefix(t *testing.T) {
 	require.Equal(t, "info", event.Level)
 	require.Equal(t, "Added peer", event.Message)
 }
+
+func TestParseVoteSetIncludesBitmap(t *testing.T) {
+	recv, total, maj23, bits := parseVoteSet("VoteSet{H:19497 R:0 T:2 +2/3:<nil>(0.571) BA{7:x__xx__} map[]}")
+
+	require.Equal(t, 3, recv)
+	require.Equal(t, 7, total)
+	require.False(t, maj23)
+	require.Equal(t, "x__xx__", bits)
+}

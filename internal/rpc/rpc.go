@@ -16,8 +16,8 @@ var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // ABCIInfo holds the response of the /abci_info endpoint.
 type ABCIInfo struct {
-	AppVersion string `json:"app_version"`
-	LastBlockHeight int64  `json:"last_block_height"`
+	AppVersion       string `json:"app_version"`
+	LastBlockHeight  int64  `json:"last_block_height"`
 	LastBlockAppHash string `json:"last_block_app_hash"`
 }
 
@@ -64,12 +64,14 @@ type ConsensusState struct {
 	ProposalBlockHash string `json:"proposal_block_hash,omitempty"`
 	LockedBlockHash   string `json:"locked_block_hash,omitempty"`
 
-	PrevotesReceived   int  `json:"prevotes_received,omitempty"`
-	PrevotesTotal      int  `json:"prevotes_total,omitempty"`
-	PrevotesMaj23      bool `json:"prevotes_maj23,omitempty"`
-	PrecommitsReceived int  `json:"precommits_received,omitempty"`
-	PrecommitsTotal    int  `json:"precommits_total,omitempty"`
-	PrecommitsMaj23    bool `json:"precommits_maj23,omitempty"`
+	PrevotesReceived   int    `json:"prevotes_received,omitempty"`
+	PrevotesTotal      int    `json:"prevotes_total,omitempty"`
+	PrevotesMaj23      bool   `json:"prevotes_maj23,omitempty"`
+	PrevotesBitArray   string `json:"prevotes_bit_array,omitempty"`
+	PrecommitsReceived int    `json:"precommits_received,omitempty"`
+	PrecommitsTotal    int    `json:"precommits_total,omitempty"`
+	PrecommitsMaj23    bool   `json:"precommits_maj23,omitempty"`
+	PrecommitsBitArray string `json:"precommits_bit_array,omitempty"`
 }
 
 // FetchConsensusState calls <endpoint>/consensus_state and returns the parsed response.
@@ -114,8 +116,8 @@ func parseConsensusState(data []byte) (ConsensusState, error) {
 		if rvs.Round != cs.Round {
 			continue
 		}
-		cs.PrevotesReceived, cs.PrevotesTotal, cs.PrevotesMaj23 = parseBitArray(rvs.PrevotesBitArray)
-		cs.PrecommitsReceived, cs.PrecommitsTotal, cs.PrecommitsMaj23 = parseBitArray(rvs.PrecommitsBitArray)
+		cs.PrevotesReceived, cs.PrevotesTotal, cs.PrevotesMaj23, cs.PrevotesBitArray = parseBitArray(rvs.PrevotesBitArray)
+		cs.PrecommitsReceived, cs.PrecommitsTotal, cs.PrecommitsMaj23, cs.PrecommitsBitArray = parseBitArray(rvs.PrecommitsBitArray)
 		break
 	}
 	return cs, nil
@@ -147,13 +149,13 @@ func roundStepName(step int) string {
 // parseBitArray extracts vote counts from a TM2 bit-array string.
 // Format: "BA{N:xxx___} M/T = F" — N slots, x=voted, _=not voted.
 // Returns the number of 'x' bits, total slots, and whether the fraction > 2/3.
-func parseBitArray(s string) (received, total int, maj23 bool) {
+func parseBitArray(s string) (received, total int, maj23 bool, bits string) {
 	start := strings.Index(s, ":")
 	end := strings.Index(s, "}")
 	if start < 0 || end < 0 || end <= start {
 		return
 	}
-	bits := s[start+1 : end]
+	bits = s[start+1 : end]
 	total = len(bits)
 	for _, c := range bits {
 		if c == 'x' {

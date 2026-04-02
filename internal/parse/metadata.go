@@ -91,6 +91,9 @@ func mergeMetadataNode(dst, src model.MetadataNode) model.MetadataNode {
 	if src.ValidatorPubKey != "" {
 		dst.ValidatorPubKey = src.ValidatorPubKey
 	}
+	if src.RPCEndpoint != "" {
+		dst.RPCEndpoint = src.RPCEndpoint
+	}
 	return dst
 }
 

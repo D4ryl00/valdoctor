@@ -164,6 +164,9 @@ func Text(report model.Report, opts TextOptions) string {
 		}
 
 		b.WriteString("\n" + c.bold("Consensus state (end of window)") + "\n")
+		if reportHasVoteBitmaps(report) {
+			fmt.Fprintf(&b, "%s\n", c.dim("  vote bitmap labels use genesis validator order when sizes match"))
+		}
 		for _, node := range report.Nodes {
 			if node.LastHeight == 0 {
 				if node.Role == model.RoleValidator {
@@ -208,6 +211,8 @@ func Text(report model.Report, opts TextOptions) string {
 					node.PrevotesReceived, node.PrevotesTotal, prevMaj,
 					node.PrecommitsReceived, node.PrecommitsTotal, precomMaj,
 				)
+				renderVoteBitmapDetails(&b, c, "prevote", node.PrevotesBitArray, report.ValidatorSlots)
+				renderVoteBitmapDetails(&b, c, "precommit", node.PrecommitsBitArray, report.ValidatorSlots)
 			}
 			if node.MaxRoundSeen >= 3 {
 				fmt.Fprintf(&b, "  %s max_round=%d at h%d\n",
@@ -275,6 +280,9 @@ func Text(report model.Report, opts TextOptions) string {
 		}
 		if len(stallNodes) > 0 {
 			b.WriteString("\n" + c.bold("Consensus stall state") + "\n")
+			if reportHasVoteBitmaps(report) {
+				fmt.Fprintf(&b, "%s\n", c.dim("  vote bitmap labels use genesis validator order when sizes match"))
+			}
 
 			// Detect cross-node discrepancies for highlighting.
 			heights := map[int64]bool{}
@@ -373,6 +381,7 @@ func Text(report model.Report, opts TextOptions) string {
 						suffix = c.yellow("  ← stuck here")
 					}
 					fmt.Fprintf(&b, "%d/%d%s%s\n", ss.PrevotesReceived, ss.PrevotesTotal, maj, suffix)
+					renderVoteBitmapDetails(&b, c, "prevote", ss.PrevotesBitArray, report.ValidatorSlots)
 				}
 
 				// ── Precommit step ────────────────────────────────────────
@@ -396,6 +405,7 @@ func Text(report model.Report, opts TextOptions) string {
 						suffix = c.yellow("  ← stuck here")
 					}
 					fmt.Fprintf(&b, "%d/%d%s%s\n", ss.PrecommitsReceived, ss.PrecommitsTotal, maj, suffix)
+					renderVoteBitmapDetails(&b, c, "precommit", ss.PrecommitsBitArray, report.ValidatorSlots)
 				}
 
 				// ── Commit ────────────────────────────────────────────────
@@ -530,4 +540,81 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+func reportHasVoteBitmaps(report model.Report) bool {
+	for _, node := range report.Nodes {
+		if node.PrevotesBitArray != "" || node.PrecommitsBitArray != "" {
+			return true
+		}
+		if node.StallState != nil && (node.StallState.PrevotesBitArray != "" || node.StallState.PrecommitsBitArray != "") {
+			return true
+		}
+	}
+	return false
+}
+
+func renderVoteBitmapDetails(b *strings.Builder, c colorizer, voteType, bits string, slots []model.ValidatorSlot) {
+	if bits == "" {
+		fmt.Fprintf(b, "  %s bitmap: %s\n", voteType, c.dim("unavailable"))
+		return
+	}
+	fmt.Fprintf(b, "  %s bitmap: %s\n", voteType, c.dim(bits))
+	if summary := summarizeVoteBitmap(bits, slots); summary != "" {
+		fmt.Fprintf(b, "  %s %s\n", c.dim(voteType+":"), summary)
+	}
+}
+
+func summarizeVoteBitmap(bits string, slots []model.ValidatorSlot) string {
+	if bits == "" {
+		return ""
+	}
+	if len(slots) != len(bits) {
+		return fmt.Sprintf("validator labels unavailable (bitmap=%d, genesis=%d)", len(bits), len(slots))
+	}
+
+	var present []string
+	var missing []string
+	for i, bit := range bits {
+		label := fmt.Sprintf("%d:%s", i+1, voteSlotLabel(slots[i]))
+		if bit == 'x' {
+			present = append(present, label)
+		} else {
+			missing = append(missing, label)
+		}
+	}
+
+	kind := "missing"
+	items := missing
+	if len(present) < len(missing) {
+		kind = "present"
+		items = present
+	}
+	return kind + " " + joinVoteSlotLabels(items, 6)
+}
+
+func joinVoteSlotLabels(items []string, limit int) string {
+	if len(items) == 0 {
+		return "none"
+	}
+	if len(items) <= limit {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:limit], ", ") + fmt.Sprintf(", ... %d more", len(items)-limit)
+}
+
+func voteSlotLabel(slot model.ValidatorSlot) string {
+	if slot.Node != "" {
+		return slot.Node
+	}
+	if slot.Name != "" {
+		return slot.Name
+	}
+	if slot.Address != "" {
+		if len(slot.Address) > 12 {
+			return slot.Address[:12] + "..."
+		}
+		return slot.Address
+	}
+	return fmt.Sprintf("slot-%d", slot.Index)
 }
