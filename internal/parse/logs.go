@@ -371,6 +371,28 @@ func classifyMessage(msg string) model.EventKind {
 	// ── Startup / configuration ────────────────────────────────────────────
 	case strings.Contains(msg, "unable to update config field"):
 		return model.EventConfigError
+	case strings.Contains(msg, "invalid persistent peer address"):
+		return model.EventPeerConfigError
+	case strings.Contains(msg, "invalid private peer ID"):
+		return model.EventPeerConfigError
+	case strings.Contains(msg, "Error loading ConsensusState wal"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Encountered corrupt WAL file"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Please repair the WAL file before restarting"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Error on catchup replay. Proceeding to start ConsensusState anyway"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Failed to open WAL for consensus state"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Periodic WAL flush failed"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Error writing msg to consensus wal"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "Error writing height to consensus wal"):
+		return model.EventConsensusWALIssue
+	case strings.Contains(msg, "WriteSync failed to flush consensus wal"):
+		return model.EventConsensusWALIssue
 
 	// ── Fast-sync (blockchain reactor) ────────────────────────────────────
 	case strings.Contains(msg, "SwitchToConsensus"):
@@ -401,6 +423,10 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventConsensusFailure
 	case strings.Contains(msg, "Found conflicting vote from ourselves"):
 		return model.EventConflictingVote
+	case strings.Contains(msg, "Error signing vote"):
+		return model.EventSignVoteError
+	case strings.Contains(msg, "enterPropose: Error signing proposal"):
+		return model.EventSignProposalError
 	case strings.Contains(msg, "Error on ApplyBlock"):
 		return model.EventApplyBlockError
 	case strings.Contains(msg, "enterPrevote: ProposalBlock is nil"):
@@ -456,6 +482,8 @@ func classifyMessage(msg string) model.EventKind {
 
 	// ── Remote signer ─────────────────────────────────────────────────────
 	case strings.Contains(msg, "Sign request failed"):
+		return model.EventRemoteSignerFailure
+	case strings.Contains(msg, "PubKey request failed"):
 		return model.EventRemoteSignerFailure
 	case strings.Contains(msg, "Connected to server"):
 		return model.EventRemoteSignerConnect

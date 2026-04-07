@@ -599,6 +599,113 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			})
 		}
 
+		if count := countByKind(nodeEvents, model.EventPeerConfigError); count > 0 {
+			invalidPersistentPeer := 0
+			invalidPrivatePeer := 0
+			for _, e := range nodeEvents {
+				if e.Kind != model.EventPeerConfigError {
+					continue
+				}
+				switch {
+				case strings.Contains(e.Message, "invalid persistent peer address"):
+					invalidPersistentPeer++
+				case strings.Contains(e.Message, "invalid private peer ID"):
+					invalidPrivatePeer++
+				}
+			}
+
+			summaryParts := make([]string, 0, 2)
+			if invalidPersistentPeer > 0 {
+				summaryParts = append(summaryParts, fmt.Sprintf("%d invalid persistent peer address entry(s)", invalidPersistentPeer))
+			}
+			if invalidPrivatePeer > 0 {
+				summaryParts = append(summaryParts, fmt.Sprintf("%d invalid private peer ID entry(s)", invalidPrivatePeer))
+			}
+
+			findings = append(findings, model.Finding{
+				ID:         "peer-config-error-" + node,
+				Title:      fmt.Sprintf("Peer configuration errors on %s", node),
+				Severity:   model.SeverityMedium,
+				Confidence: model.ConfidenceHigh,
+				Scope:      node,
+				Summary:    fmt.Sprintf("Startup rejected %s.", strings.Join(summaryParts, " and ")),
+				Evidence:   firstEvidence(nodeEvents, model.EventPeerConfigError, 3),
+				PossibleCauses: []string{
+					"persistent_peers contains malformed node IDs or addresses",
+					"private_peer_ids contains malformed peer IDs",
+				},
+				SuggestedActions: []string{
+					"validate persistent_peers and private_peer_ids syntax in config.toml",
+					"compare entries against the expected `nodeID@host:port` format",
+				},
+			})
+		}
+
+		if count := countByKind(nodeEvents, model.EventConsensusWALIssue); count > 0 {
+			replayIssue := false
+			corruptionIssue := false
+			writeIssue := false
+			for _, e := range nodeEvents {
+				if e.Kind != model.EventConsensusWALIssue {
+					continue
+				}
+				switch {
+				case strings.Contains(e.Message, "catchup replay"):
+					replayIssue = true
+				case strings.Contains(e.Message, "corrupt WAL"),
+					strings.Contains(e.Message, "repair the WAL"),
+					strings.Contains(e.Message, "loading ConsensusState wal"),
+					strings.Contains(e.Message, "open WAL for consensus state"):
+					corruptionIssue = true
+				case strings.Contains(e.Message, "flush"),
+					strings.Contains(e.Message, "writing msg to consensus wal"),
+					strings.Contains(e.Message, "writing height to consensus wal"):
+					writeIssue = true
+				}
+			}
+
+			sev := model.SeverityHigh
+			summary := fmt.Sprintf("%d consensus WAL issue(s) were logged.", count)
+			possibleCauses := []string{
+				"unclean shutdown or crash left the consensus WAL incomplete",
+				"disk or filesystem error prevented WAL data from being flushed durably",
+			}
+			suggestedActions := []string{
+				"inspect WAL-related errors and node restarts around the incident window",
+				"check disk health, free space, and filesystem logs on the validator host",
+			}
+			if replayIssue {
+				summary = "Consensus WAL replay failed during startup, and the node continued without full catchup from the WAL."
+				suggestedActions = append(suggestedActions,
+					"compare the validator sign-state file and WAL around the affected height before restarting again")
+			}
+			if writeIssue {
+				summary = "Consensus WAL writes or flushes failed. If the node restarts after this, signer and consensus state can diverge."
+				suggestedActions = append(suggestedActions,
+					"avoid restarting the validator until the WAL durability problem is understood")
+			}
+			if corruptionIssue {
+				sev = model.SeverityCritical
+				summary = "The consensus WAL could not be opened or was reported corrupt. Replay safety is compromised until the WAL is repaired or replaced."
+				possibleCauses = append(possibleCauses,
+					"consensus WAL corruption from truncated or partially written data")
+				suggestedActions = append(suggestedActions,
+					"repair or restore the consensus WAL before putting the validator back into service")
+			}
+
+			findings = append(findings, model.Finding{
+				ID:               "consensus-wal-issue-" + node,
+				Title:            fmt.Sprintf("Consensus WAL issues on %s", node),
+				Severity:         sev,
+				Confidence:       model.ConfidenceHigh,
+				Scope:            node,
+				Summary:          summary,
+				Evidence:         firstEvidence(nodeEvents, model.EventConsensusWALIssue, 3),
+				PossibleCauses:   possibleCauses,
+				SuggestedActions: suggestedActions,
+			})
+		}
+
 		// Consensus panic — node crashed; always critical.
 		if count := countByKind(nodeEvents, model.EventConsensusFailure); count > 0 {
 			// Find the panic event (first occurrence).
@@ -730,6 +837,112 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 					"immediately stop all nodes sharing this key",
 					"investigate whether a double-sign slashing event occurred",
 				},
+			})
+		}
+
+		// Vote signing errors can reveal signer-state regressions or attempted
+		// conflicting votes even when TM2 does not emit the more explicit
+		// "Found conflicting vote from ourselves" message.
+		if count := countByKind(nodeEvents, model.EventSignVoteError); count > 0 {
+			conflictingHRS := 0
+			for _, e := range nodeEvents {
+				if e.Kind != model.EventSignVoteError {
+					continue
+				}
+				errStr, _ := e.Fields["err"].(string)
+				if strings.Contains(errStr, "same HRS with conflicting data") {
+					conflictingHRS++
+				}
+			}
+			if conflictingHRS > 0 {
+				findings = append(findings, model.Finding{
+					ID:         "sign-vote-conflict-" + node,
+					Title:      fmt.Sprintf("Conflicting vote signing attempt on %s", node),
+					Severity:   model.SeverityCritical,
+					Confidence: model.ConfidenceHigh,
+					Scope:      node,
+					Summary: fmt.Sprintf(
+						"The local signer rejected %d vote signing attempt(s) because the node tried to sign different data at the same height/round/step.",
+						conflictingHRS,
+					),
+					Evidence: firstEvidence(nodeEvents, model.EventSignVoteError, 2),
+					PossibleCauses: []string{
+						"the same validator key is being used by more than one node",
+						"the validator was reset or replayed unsafely while signer state was preserved",
+						"consensus state regressed and attempted to re-sign a prior H/R/S with different vote data",
+					},
+					SuggestedActions: []string{
+						"immediately verify that no second validator instance is using the same signing key",
+						"inspect signer state and recent restarts around the affected height",
+						"check whether `unsafe_reset_all` or WAL replay happened without resetting the signer state",
+					},
+				})
+			} else {
+				findings = append(findings, model.Finding{
+					ID:         "sign-vote-error-" + node,
+					Title:      fmt.Sprintf("Vote signing errors on %s", node),
+					Severity:   model.SeverityHigh,
+					Confidence: model.ConfidenceMedium,
+					Scope:      node,
+					Summary:    fmt.Sprintf("The node failed to sign %d vote(s).", count),
+					Evidence:   firstEvidence(nodeEvents, model.EventSignVoteError, 2),
+					PossibleCauses: []string{
+						"local signer state regressed relative to consensus state",
+						"the validator restarted or replayed into an earlier round/step",
+						"signer implementation rejected the request to avoid unsafe signing",
+					},
+					SuggestedActions: []string{
+						"inspect the `err` field on the signing failures to identify whether the regression was round-, step-, or HRS-related",
+						"check validator restart and WAL replay activity around the affected height",
+					},
+				})
+			}
+		}
+
+		if count := countByKind(nodeEvents, model.EventSignProposalError); count > 0 {
+			sev := model.SeverityHigh
+			summary := fmt.Sprintf("The node failed to sign %d proposal(s) when it was proposer.", count)
+			possibleCauses := []string{
+				"remote signer was unavailable when the node's proposal turn arrived",
+				"signer state rejected the proposal because of height/round regression",
+				"local signer state diverged from the consensus state machine",
+			}
+			suggestedActions := []string{
+				"inspect the `err` field on the proposal-signing failure",
+				"check remote-signer connectivity and signer state at the affected height/round",
+			}
+
+			for _, e := range nodeEvents {
+				if e.Kind != model.EventSignProposalError {
+					continue
+				}
+				errStr, _ := e.Fields["err"].(string)
+				if strings.Contains(errStr, "same HRS with conflicting data") {
+					sev = model.SeverityCritical
+					summary = "The node attempted to sign a conflicting proposal at the same height/round/step, and the signer refused."
+					possibleCauses = []string{
+						"the same validator key is being used by more than one node",
+						"the validator replayed or reset into a conflicting signer state",
+						"proposal-signing state regressed while signer state was preserved",
+					}
+					suggestedActions = []string{
+						"immediately verify that no duplicate validator instance is sharing the same key",
+						"inspect WAL/sign-state interactions around the affected proposal height",
+					}
+					break
+				}
+			}
+
+			findings = append(findings, model.Finding{
+				ID:               "sign-proposal-error-" + node,
+				Title:            fmt.Sprintf("Proposal signing failures on %s", node),
+				Severity:         sev,
+				Confidence:       model.ConfidenceHigh,
+				Scope:            node,
+				Summary:          summary,
+				Evidence:         firstEvidence(nodeEvents, model.EventSignProposalError, 2),
+				PossibleCauses:   possibleCauses,
+				SuggestedActions: suggestedActions,
 			})
 		}
 
@@ -1099,7 +1312,7 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 					"review KMS connection timeout configuration",
 				}
 			} else {
-				summary = fmt.Sprintf("%d signing request failure(s) observed.", ns.SignerFailureCount)
+				summary = fmt.Sprintf("%d remote-signer request failure(s) observed.", ns.SignerFailureCount)
 				possibleCauses = []string{
 					"KMS process not running or not reachable on the configured socket",
 					"key not loaded in the KMS",
