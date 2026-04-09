@@ -17,6 +17,7 @@ func NewRootCmd(io commands.IO) *commands.Command {
 
 	cmd.AddSubCommands(
 		newInspectCmd(io),
+		newHeightCmd(io),
 		newConfigCmd(io),
 	)
 

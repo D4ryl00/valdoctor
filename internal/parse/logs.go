@@ -36,6 +36,14 @@ var (
 	peerNRSRE = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
 	// peerAddrRE extracts the bech32 peer address from "Peer{MConn{...} g1xxx in/out}".
 	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
+	// voteDetailRE extracts validator index and block hash from
+	// "Added to prevote/precommit" messages.
+	// TM2 vote string format: Vote{IDX:ADDRSHORT HEIGHT/ROUND(TYPE) HASH}
+	// HASH is a hex string or "<nil>" for nil votes.
+	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):[0-9A-Fa-f]+ \d+/\d+\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
+	// timeoutStepRE extracts the step name from "Timed out" messages when the
+	// step is embedded in the message text rather than a structured field.
+	timeoutStepRE = regexp.MustCompile(`(?i)step[=:\s]+(\w+)`)
 )
 
 // ParseStats holds aggregated peer-gossip data extracted during parsing.
@@ -706,8 +714,8 @@ func enrichEvent(event *model.Event) {
 		event.Round = extractRound(event.Message, event.Fields)
 	}
 
-	// For prevote/precommit events, parse the VoteSet string to extract vote counts.
-	// The VoteSet is stored in "prevotes" or "precommits" field respectively.
+	// For prevote/precommit events, parse the VoteSet string to extract vote counts,
+	// and parse the individual vote to extract validator index + block hash.
 	if event.Kind == model.EventAddedPrevote || event.Kind == model.EventAddedPrecommit {
 		fieldName := "prevotes"
 		if event.Kind == model.EventAddedPrecommit {
@@ -720,6 +728,51 @@ func enrichEvent(event *model.Event) {
 				event.Fields["_vtotal"] = total
 				event.Fields["_vmaj23"] = maj23
 				event.Fields["_vbits"] = bits
+			}
+		}
+		// Extract per-validator detail: index and voted block hash.
+		// Try the "vote" structured field first (JSON log format), then fall back
+		// to the raw message (console log format appends the vote string).
+		voteStr, _ := event.Fields["vote"].(string)
+		if voteStr == "" {
+			voteStr = event.Message
+		}
+		if m := voteDetailRE.FindStringSubmatch(voteStr); m != nil {
+			idx, _ := strconv.Atoi(m[1])
+			event.Fields["_vidx"] = idx
+			if m[2] == "<nil>" {
+				event.Fields["_vhash"] = ""
+			} else {
+				event.Fields["_vhash"] = m[2]
+			}
+		}
+	}
+
+	// For timeout events, extract the consensus step so callers can classify
+	// votes that arrive after the step boundary as "late".
+	if event.Kind == model.EventTimeout {
+		if step, ok := event.Fields["step"].(string); ok && step != "" {
+			event.Fields["_step"] = step
+		} else if m := timeoutStepRE.FindStringSubmatch(event.Message); m != nil {
+			event.Fields["_step"] = m[1]
+		}
+	}
+
+	// For peer add/drop events, extract the bech32 peer address for identity
+	// resolution and (for drops) the error reason.
+	if event.Kind == model.EventAddedPeer || event.Kind == model.EventStoppedPeer {
+		peerStr, _ := event.Fields["peer"].(string)
+		if peerStr == "" {
+			peerStr, _ = event.Fields["src"].(string)
+		}
+		if peerStr != "" {
+			if m := peerAddrRE.FindStringSubmatch(peerStr); m != nil {
+				event.Fields["_paddr"] = m[1]
+			}
+		}
+		if event.Kind == model.EventStoppedPeer {
+			if errStr, ok := event.Fields["err"].(string); ok && errStr != "" {
+				event.Fields["_perr"] = errStr
 			}
 		}
 	}
@@ -839,6 +892,48 @@ func StreamCategoryLines(source model.Source, r io.Reader, targetKey string, w i
 		}
 	}
 	return scanner.Err()
+}
+
+// FilterEventsByHeight scans r and returns the events relevant to analysing a
+// specific block height H:
+//   - all classified events where event.Height == H
+//   - EventFinalizeCommit at H-1 (used to determine the block-period window start)
+//   - EventAddedPeer / EventStoppedPeer with timestamps (filtered to the window later)
+func FilterEventsByHeight(source model.Source, r io.Reader, height int64) ([]model.Event, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	var events []model.Event
+	lineNo := 0
+
+	for scanner.Scan() {
+		lineNo++
+		raw := scanner.Text()
+		if raw == "" {
+			continue
+		}
+		event, _ := ParseLogLine(source, raw, lineNo)
+		if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
+			continue
+		}
+
+		keep := false
+		switch {
+		case event.Height == height:
+			// All classified events at the target height.
+			keep = true
+		case event.Kind == model.EventFinalizeCommit && event.Height == height-1:
+			// Needed to establish the block-period window start.
+			keep = true
+		case (event.Kind == model.EventAddedPeer || event.Kind == model.EventStoppedPeer) && event.HasTimestamp:
+			// Peer connection changes anywhere in the log; windowed later.
+			keep = true
+		}
+		if keep {
+			events = append(events, event)
+		}
+	}
+	return events, scanner.Err()
 }
 
 func DefaultNodeName(path string, used map[string]int) string {

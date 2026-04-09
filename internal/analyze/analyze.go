@@ -2255,7 +2255,140 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		return severityRank(findings[i].Severity) > severityRank(findings[j].Severity)
 	})
 
+	// ── Clock-skew detection ────────────────────────────────────────────────────
+	// Only fire when ≥2 nodes have FinalizeCommit events at the same height so
+	// we can actually compare timestamps.
+	findings = append(findings, detectClockSkew(events)...)
+
 	return findings
+}
+
+// detectClockSkew groups EventFinalizeCommit events by height, computes the
+// timestamp spread across nodes at each height, and emits a finding when the
+// worst-case spread exceeds 200 ms and at least 2 nodes contributed.
+func detectClockSkew(events []model.Event) []model.Finding {
+	type nodeTS struct {
+		node string
+		ts   time.Time
+	}
+	// Collect earliest FinalizeCommit timestamp per (height, node).
+	type key struct {
+		height int64
+		node   string
+	}
+	firstByKey := map[key]time.Time{}
+	for _, ev := range events {
+		if ev.Kind != model.EventFinalizeCommit || !ev.HasTimestamp || ev.Height == 0 {
+			continue
+		}
+		k := key{ev.Height, ev.Node}
+		if t, ok := firstByKey[k]; !ok || ev.Timestamp.Before(t) {
+			firstByKey[k] = ev.Timestamp
+		}
+	}
+
+	// Group by height; skip heights with only one node.
+	byHeight := map[int64][]nodeTS{}
+	for k, t := range firstByKey {
+		byHeight[k.height] = append(byHeight[k.height], nodeTS{k.node, t})
+	}
+
+	type heightSpread struct {
+		height int64
+		spread time.Duration
+		early  nodeTS
+		late   nodeTS
+	}
+	var spreads []heightSpread
+	var maxSpread time.Duration
+
+	for h, entries := range byHeight {
+		if len(entries) < 2 {
+			continue
+		}
+		var earliest, latest nodeTS
+		for _, e := range entries {
+			if earliest.ts.IsZero() || e.ts.Before(earliest.ts) {
+				earliest = e
+			}
+			if e.ts.After(latest.ts) {
+				latest = e
+			}
+		}
+		spread := latest.ts.Sub(earliest.ts)
+		spreads = append(spreads, heightSpread{h, spread, earliest, latest})
+		if spread > maxSpread {
+			maxSpread = spread
+		}
+	}
+
+	const warnThreshold = 200 * time.Millisecond
+	if len(spreads) == 0 || maxSpread < warnThreshold {
+		return nil
+	}
+
+	sort.Slice(spreads, func(i, j int) bool { return spreads[i].spread > spreads[j].spread })
+	worst := spreads[0]
+
+	exceedWarn, exceedCrit := 0, 0
+	for _, s := range spreads {
+		if s.spread >= time.Second {
+			exceedCrit++
+		} else if s.spread >= warnThreshold {
+			exceedWarn++
+		}
+	}
+
+	sev := model.SeverityMedium
+	if worst.spread >= time.Second {
+		sev = model.SeverityHigh
+	}
+
+	evidence := []model.Evidence{
+		{
+			Node:      worst.early.node,
+			Timestamp: worst.early.ts.UTC().Format(time.RFC3339Nano),
+			Message:   fmt.Sprintf("FinalizeCommit h%d (earliest)", worst.height),
+		},
+		{
+			Node:      worst.late.node,
+			Timestamp: worst.late.ts.UTC().Format(time.RFC3339Nano),
+			Message:   fmt.Sprintf("FinalizeCommit h%d (latest, +%s)", worst.height, worst.spread.Round(time.Millisecond)),
+		},
+	}
+	total := exceedWarn + exceedCrit
+	if total > 2 {
+		evidence = append(evidence, model.Evidence{
+			Message: fmt.Sprintf("%d height(s) had a spread ≥%s, %d had a spread ≥1s",
+				total, warnThreshold, exceedCrit),
+		})
+	}
+
+	return []model.Finding{{
+		ID:         "clock-skew",
+		Title:      fmt.Sprintf("Clock skew of up to %s detected between validators", worst.spread.Round(time.Millisecond)),
+		Severity:   sev,
+		Confidence: model.ConfidenceHigh,
+		Scope:      "global",
+		Summary: fmt.Sprintf(
+			"FinalizeCommit timestamps differ by up to %s across validators. "+
+				"Clock skew causes non-uniform timeout expiry: one validator's propose or "+
+				"prevote timeout fires before others, increasing unnecessary round escalations.",
+			worst.spread.Round(time.Millisecond),
+		),
+		Evidence: evidence,
+		PossibleCauses: []string{
+			"system clock not synchronized via NTP",
+			"NTP server misconfigured or unreachable on one or more nodes",
+			"VM clock drift in virtualised or containerised environments",
+		},
+		SuggestedActions: []string{
+			"run `timedatectl status` on each validator to verify NTP is active and the offset is < 100ms",
+			"ensure all nodes use the same NTP pool (e.g. pool.ntp.org) or a local stratum-1 server",
+			"for cloud VMs, verify hypervisor clock synchronisation is enabled",
+			fmt.Sprintf("use `valdoctor height <N>` on height %d for a per-node clock timeline", worst.height),
+		},
+	}}
 }
 
 func groupEventsByNode(events []model.Event) map[string][]model.Event {
