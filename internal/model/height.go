@@ -39,6 +39,12 @@ type RoundSummary struct {
 	ProposalHash      string // truncated to 8 hex chars for display
 	ProposalFromRound int    // >0 when the proposal re-uses a POL block from an earlier round
 	ProposalValid     bool
+	// ProposalReceivedLate is true when the complete block arrived AFTER the
+	// node had already voted nil due to propose-step timeout.
+	ProposalReceivedLate bool
+	ProposalLateTimeStr  string // formatted timestamp of late receipt
+	// ProposerAddr is the proposer address for this round (from enterPropose log).
+	ProposerAddr string
 
 	// Prevote aggregate (across all observed logs for this round)
 	PrevotesForBlock int
@@ -54,6 +60,10 @@ type RoundSummary struct {
 	PrecommitsOther    int
 	PrecommitsTotal    int
 	PrecommitsMaj23    bool
+	// PrecommitDataSeen is true only when at least one precommit log event was
+	// observed. When false, the precommit narrative should say "not reached"
+	// rather than inferring nil.
+	PrecommitDataSeen bool
 
 	// Human-readable narratives derived from classified log events.
 	PrevoteNarrative   string
@@ -61,7 +71,10 @@ type RoundSummary struct {
 
 	// Round outcome
 	Committed bool // FinalizeCommit observed at this round
-	TimedOut  bool // at least one timeout event observed at this (height, round)
+	// TimedOut is true only when a propose-step or prevote-step timeout was
+	// observed (RoundStepPropose/RoundStepPrevote). The RoundStepNewHeight
+	// timeout is a normal startup mechanism and does NOT set this flag.
+	TimedOut bool
 }
 
 // PeerEvent records a single peer connection change during the block's consensus window.
@@ -146,6 +159,15 @@ type HeightReport struct {
 
 	// FocusNode is the node name for single-node view; empty = aggregate.
 	FocusNode string
+
+	// CommittedInLog is true when a FinalizeCommit event for this height was
+	// observed in at least one provided log file.
+	CommittedInLog bool
+
+	// ValidatorSetSize is the runtime validator count inferred from VoteSet
+	// bit arrays; 0 if not determinable. When > len(genesis.Validators) the
+	// vote grid is incomplete (validators were added after genesis).
+	ValidatorSetSize int
 
 	Warnings []string
 }

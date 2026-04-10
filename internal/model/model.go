@@ -110,6 +110,7 @@ const (
 	EventRemoteSignerFailure    EventKind = "remote_signer_failure"
 	EventRemoteSignerConnect    EventKind = "remote_signer_connected"
 	EventReceivedCompletePart   EventKind = "received_complete_proposal_block"
+	EventReceivedProposal       EventKind = "received_proposal"
 	EventFastSyncBlockError     EventKind = "fastsync_block_validation_error"
 	EventAddedPrevote           EventKind = "added_prevote"
 	EventAddedPrecommit         EventKind = "added_precommit"

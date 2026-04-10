@@ -167,6 +167,7 @@ func execHeight(_ context.Context, cfg *heightCfg, height int64, io commands.IO)
 	var blockHeader *rpc.BlockHeader
 	var commitSigs []rpc.CommitSig
 	var txResults []model.TxSummary
+	var runtimeValidators []rpc.ValidatorEntry
 
 	if !cfg.offline {
 		// Use the first node with an RPC endpoint.
@@ -201,21 +202,29 @@ func execHeight(_ context.Context, cfg *heightCfg, height int64, io commands.IO)
 			} else {
 				warnings = append(warnings, fmt.Sprintf("RPC /block_results@%s: %v", ep, fetchErr))
 			}
+
+			if vals, fetchErr := rpc.FetchValidators(ep, height); fetchErr == nil {
+				runtimeValidators = vals
+			} else {
+				warnings = append(warnings, fmt.Sprintf("RPC /validators@%s: %v", ep, fetchErr))
+			}
+
 			break // only query one RPC endpoint for now
 		}
 	}
 
 	// ── Build report ─────────────────────────────────────────────────────────
 	report := analyze.BuildHeightReport(analyze.HeightInput{
-		Height:     height,
-		Genesis:    genesis,
-		Sources:    sources,
-		Metadata:   metadata,
-		Events:     allEvents,
-		Block:      blockHeader,
-		CommitSigs: commitSigs,
-		TxResults:  txResults,
-		FocusNode:  cfg.node,
+		Height:            height,
+		Genesis:           genesis,
+		Sources:           sources,
+		Metadata:          metadata,
+		Events:            allEvents,
+		Block:             blockHeader,
+		CommitSigs:        commitSigs,
+		TxResults:         txResults,
+		RuntimeValidators: runtimeValidators,
+		FocusNode:         cfg.node,
 	})
 	report.Warnings = append(report.Warnings, warnings...)
 

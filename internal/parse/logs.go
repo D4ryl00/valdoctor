@@ -2,6 +2,8 @@ package parse
 
 import (
 	"bufio"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,11 +38,16 @@ var (
 	peerNRSRE = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
 	// peerAddrRE extracts the bech32 peer address from "Peer{MConn{...} g1xxx in/out}".
 	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
-	// voteDetailRE extracts validator index and block hash from
-	// "Added to prevote/precommit" messages.
+	// voteDetailRE extracts validator index, address fingerprint, and block hash
+	// from "Added to prevote/precommit" messages (console/VoteSet inline format).
 	// TM2 vote string format: Vote{IDX:ADDRSHORT HEIGHT/ROUND(TYPE) HASH}
+	// ADDRSHORT is the first 6 bytes of the validator address (12 hex chars).
 	// HASH is a hex string or "<nil>" for nil votes.
-	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):[0-9A-Fa-f]+ \d+/\d+\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
+	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):([0-9A-Fa-f]+) \d+/\d+\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
+	// voteReceiveRE extracts validator index, address fingerprint, height, round,
+	// type name, and block hash from "Receive" (consensus) messages.
+	// Format: [Vote Vote{IDX:ADDRSHORT HEIGHT/ROUND/TYPE(TypeName) BLOCKHASH SIG @ TS}]
+	voteReceiveRE = regexp.MustCompile(`\[Vote Vote\{(\d+):([0-9A-Fa-f]+) (\d+)/(\d+)/\d+\((\w+)\) ([0-9A-Fa-f]+)`)
 	// timeoutStepRE extracts the step name from "Timed out" messages when the
 	// step is embedded in the message text rather than a structured field.
 	timeoutStepRE = regexp.MustCompile(`(?i)step[=:\s]+(\w+)`)
@@ -523,7 +530,7 @@ func classifyMessage(msg string) model.EventKind {
 	case strings.Contains(msg, "Ignoring tock"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "Received proposal"):
-		return model.EventKnownNoise
+		return model.EventReceivedProposal
 	case strings.Contains(msg, "Received tick"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "Received tock"):
@@ -561,6 +568,11 @@ func classifyMessage(msg string) model.EventKind {
 
 	// ── Known noise — P2P message types (wire representation in logs) ──────
 	// These are raw TM2 p2p message strings printed via their String() method.
+	// "Receive" consensus messages carry individual vote details; classify by type.
+	case strings.HasPrefix(msg, "[Vote Vote{") && strings.Contains(msg, "(Prevote)"):
+		return model.EventAddedPrevote
+	case strings.HasPrefix(msg, "[Vote Vote{") && strings.Contains(msg, "(Precommit)"):
+		return model.EventAddedPrecommit
 	case strings.HasPrefix(msg, "[Vote "):
 		return model.EventKnownNoise
 	case strings.HasPrefix(msg, "[Proposal "):
@@ -722,28 +734,45 @@ func enrichEvent(event *model.Event) {
 			fieldName = "precommits"
 		}
 		if vs, ok := event.Fields[fieldName].(string); ok {
-			recv, total, maj23, bits := parseVoteSet(vs)
+			recv, total, maj23, maj23Hash, bits := parseVoteSet(vs)
 			if total > 0 {
 				event.Fields["_vrecv"] = recv
 				event.Fields["_vtotal"] = total
 				event.Fields["_vmaj23"] = maj23
+				event.Fields["_vmaj23hash"] = maj23Hash
 				event.Fields["_vbits"] = bits
 			}
 		}
-		// Extract per-validator detail: index and voted block hash.
-		// Try the "vote" structured field first (JSON log format), then fall back
-		// to the raw message (console log format appends the vote string).
-		voteStr, _ := event.Fields["vote"].(string)
-		if voteStr == "" {
-			voteStr = event.Message
-		}
-		if m := voteDetailRE.FindStringSubmatch(voteStr); m != nil {
+		// Extract per-validator detail: index, address fingerprint, and voted block hash.
+		// "Receive" (consensus) messages: [Vote Vote{IDX:ADDRSHORT H/R/T(Type) HASH SIG @ TS}].
+		// Groups: (1)=idx, (2)=addrShort, (3)=height, (4)=round, (5)=typeName, (6)=hash.
+		if m := voteReceiveRE.FindStringSubmatch(event.Message); m != nil {
 			idx, _ := strconv.Atoi(m[1])
 			event.Fields["_vidx"] = idx
-			if m[2] == "<nil>" {
+			event.Fields["_vaddrprefix"] = strings.ToUpper(m[2])
+			hash := strings.ToUpper(m[6])
+			// All-zero hash == nil vote (TM2 prints zero BlockID as "000000000000").
+			if strings.Trim(hash, "0") == "" {
 				event.Fields["_vhash"] = ""
 			} else {
-				event.Fields["_vhash"] = m[2]
+				event.Fields["_vhash"] = hash
+			}
+		} else {
+			// Fall back: "vote" structured field (JSON) or raw message (console).
+			// Groups: (1)=idx, (2)=addrShort, (3)=hash.
+			voteStr, _ := event.Fields["vote"].(string)
+			if voteStr == "" {
+				voteStr = event.Message
+			}
+			if m := voteDetailRE.FindStringSubmatch(voteStr); m != nil {
+				idx, _ := strconv.Atoi(m[1])
+				event.Fields["_vidx"] = idx
+				event.Fields["_vaddrprefix"] = strings.ToUpper(m[2])
+				if m[3] == "<nil>" {
+					event.Fields["_vhash"] = ""
+				} else {
+					event.Fields["_vhash"] = m[3]
+				}
 			}
 		}
 	}
@@ -755,6 +784,28 @@ func enrichEvent(event *model.Event) {
 			event.Fields["_step"] = step
 		} else if m := timeoutStepRE.FindStringSubmatch(event.Message); m != nil {
 			event.Fields["_step"] = m[1]
+		}
+	}
+
+	// For "Received complete proposal block" events, TM2 logs the block hash as
+	// a base64 string in the "hash" field. Decode it to uppercase hex and store
+	// it as "block_hash" so the rest of the analysis can use a uniform format.
+	if event.Kind == model.EventReceivedCompletePart {
+		if b64, ok := event.Fields["hash"].(string); ok && b64 != "" {
+			if raw, err := base64.StdEncoding.DecodeString(b64); err == nil {
+				event.Fields["block_hash"] = strings.ToUpper(hex.EncodeToString(raw))
+			}
+		}
+	}
+
+	// For "Received proposal" events, extract the full block hash from the
+	// "proposal block ID" field (format: "HASH:PARTS_COUNT:PARTS_HASH").
+	// This event carries the round correctly, unlike "Received complete proposal block".
+	if event.Kind == model.EventReceivedProposal {
+		if blockID, ok := event.Fields["proposal block ID"].(string); ok && blockID != "" {
+			if colon := strings.IndexByte(blockID, ':'); colon > 0 {
+				event.Fields["block_hash"] = strings.ToUpper(blockID[:colon])
+			}
 		}
 	}
 
@@ -780,14 +831,36 @@ func enrichEvent(event *model.Event) {
 
 // parseVoteSet extracts vote counts from a TM2 VoteSet string.
 // Format: VoteSet{H:19497 R:0 T:2 +2/3:<nil>(0.571) BA{7:x______} map[]}
-// Returns received (count of 'x'), total validators, and whether +2/3 majority was reached.
-func parseVoteSet(s string) (received, total int, maj23 bool, bits string) {
+// Returns received (count of 'x'), total validators, whether +2/3 majority was reached,
+// the block hash that achieved majority (empty string = nil majority), and the bit array.
+//
+// TM2 majority formats:
+//   +2/3:<nil>             → no majority yet (maj23=false)
+//   +2/3::0:000000000000   → nil majority (maj23=true, maj23Hash="")
+//   +2/3:CF53223F...:1:... → block majority (maj23=true, maj23Hash=block hash)
+func parseVoteSet(s string) (received, total int, maj23 bool, maj23Hash string, bits string) {
 	m := voteSetRE.FindStringSubmatch(s)
 	if m == nil {
 		return
 	}
-	// m[1] = "<nil>" or block hash, m[2] = total count, m[3] = bit array string
-	maj23 = m[1] != "<nil>"
+	// m[1] = "<nil>" or ":0:000000000000" (nil majority) or "HASH:COUNT:PARTSHASH" (block majority)
+	hashPart := strings.TrimSpace(m[1])
+	switch {
+	case hashPart == "<nil>":
+		// No majority reached yet.
+		maj23 = false
+	case strings.HasPrefix(hashPart, ":"):
+		// Nil majority: +2/3 voted nil. Block hash part is empty.
+		maj23 = true
+	default:
+		// Block majority: the part before the first ':' is the block hash.
+		maj23 = true
+		if colon := strings.IndexByte(hashPart, ':'); colon > 0 {
+			maj23Hash = strings.ToUpper(hashPart[:colon])
+		} else {
+			maj23Hash = strings.ToUpper(hashPart)
+		}
+	}
 	total, _ = strconv.Atoi(m[2])
 	bits = m[3]
 	for _, c := range bits {
@@ -810,6 +883,13 @@ func extractHeight(msg string, fields map[string]any) int64 {
 			return parsed
 		}
 	}
+	// "[Vote Vote{IDX:ADDR H/R/T(Type) HASH}]" — "Receive" consensus messages.
+	// Groups: (1)=idx, (2)=addrShort, (3)=height, (4)=round, (5)=typeName, (6)=hash.
+	if m := voteReceiveRE.FindStringSubmatch(msg); m != nil {
+		if parsed, err := strconv.ParseInt(m[3], 10, 64); err == nil {
+			return parsed
+		}
+	}
 	matches := heightRoundRE.FindStringSubmatch(msg)
 	if len(matches) == 3 {
 		if parsed, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
@@ -829,6 +909,13 @@ func extractRound(msg string, fields map[string]any) int {
 	if value, ok := fields["vote round"]; ok {
 		if parsed, ok := toInt64(value); ok {
 			return int(parsed)
+		}
+	}
+	// "[Vote Vote{IDX:ADDR H/R/T(Type) HASH}]" — "Receive" consensus messages.
+	// Groups: (1)=idx, (2)=addrShort, (3)=height, (4)=round, (5)=typeName, (6)=hash.
+	if m := voteReceiveRE.FindStringSubmatch(msg); m != nil {
+		if parsed, err := strconv.Atoi(m[4]); err == nil {
+			return parsed
 		}
 	}
 	matches := heightRoundRE.FindStringSubmatch(msg)

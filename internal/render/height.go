@@ -34,6 +34,9 @@ func HeightText(report model.HeightReport, color bool) string {
 	if report.DoubleSignDetected {
 		fmt.Fprintf(&b, "%s\n", c.red("⚠ Conflicting vote (equivocation) detected at this height"))
 	}
+	if !report.CommittedInLog && len(report.Rounds) > 0 {
+		fmt.Fprintf(&b, "%s\n", c.yellow("⚠ block not committed in the available log window"))
+	}
 
 	// ── Clock synchronisation ────────────────────────────────────────────────
 	if len(report.ClockSync) >= 2 {
@@ -59,6 +62,11 @@ func HeightText(report model.HeightReport, color bool) string {
 			fmt.Fprintf(&b, " — %s\n", c.dim("single-node view: "+report.FocusNode))
 		} else {
 			fmt.Fprintf(&b, " — %s\n", c.dim("aggregate  (use --node <name> for single-node view)"))
+		}
+		if report.ValidatorSetSize > len(report.ValidatorVotes) {
+			fmt.Fprintf(&b, "%s\n", c.yellow(fmt.Sprintf(
+				"  ⚠ runtime validator set has %d members but genesis has %d — vote grid may be incomplete",
+				report.ValidatorSetSize, len(report.ValidatorVotes))))
 		}
 		writeVoteGrid(&b, c, report.ValidatorVotes, report.Rounds)
 	}
@@ -183,10 +191,20 @@ func writeNarrativeTable(b *strings.Builder, c colorizer, rounds []model.RoundSu
 			if !rs.ProposalValid {
 				r.proposal += " [invalid]"
 			}
+			if rs.ProposalReceivedLate {
+				if rs.ProposalLateTimeStr != "" {
+					r.proposal += fmt.Sprintf(" [late@%s]", rs.ProposalLateTimeStr)
+				} else {
+					r.proposal += " [late]"
+				}
+			}
 		} else if rs.TimedOut {
 			r.proposal = "No proposal before timeout"
 		} else {
 			r.proposal = "Not observed"
+		}
+		if rs.ProposerAddr != "" {
+			r.proposal += fmt.Sprintf(" (prop: %s)", shortAddrDisplay(rs.ProposerAddr))
 		}
 
 		r.prevote = rs.PrevoteNarrative
@@ -265,6 +283,7 @@ func writeVoteGrid(b *strings.Builder, c colorizer, rows []model.ValidatorVoteRo
 	sep := strings.Repeat("─", len(header)+2)
 	fmt.Fprintf(b, " %s\n%s\n", header, sep)
 
+	hasLate := false
 	for _, vr := range rows {
 		label := fmt.Sprintf("%s [%d]", truncate(vr.Name, colVal-5), vr.Index)
 		var line strings.Builder
@@ -276,10 +295,17 @@ func writeVoteGrid(b *strings.Builder, c colorizer, rows []model.ValidatorVoteRo
 			if ok {
 				pv = colorVote(c, entry.Prevote)
 				pc = colorVote(c, entry.Precommit)
+				if entry.Prevote == model.VoteLateBlock || entry.Prevote == model.VoteLateNil ||
+					entry.Precommit == model.VoteLateBlock || entry.Precommit == model.VoteLateNil {
+					hasLate = true
+				}
 			}
 			fmt.Fprintf(&line, " │ %-6s │ %-6s ", pv, pc)
 		}
 		fmt.Fprintf(b, "%s\n", line.String())
+	}
+	if hasLate {
+		fmt.Fprintf(b, "%s\n", c.dim("  † = vote arrived after step timeout"))
 	}
 }
 
@@ -366,9 +392,6 @@ func writeTxResults(b *strings.Builder, c colorizer, txs []model.TxSummary) {
 			errStr = c.red(tx.Error)
 		}
 		fmt.Fprintf(b, " %-4d  %-12d  %-12d  %s\n", i, tx.GasWanted, tx.GasUsed, errStr)
-	}
-	if len(txs) > 1 {
-		b.WriteString(c.dim(" († = vote arrived after step timeout)\n"))
 	}
 }
 
