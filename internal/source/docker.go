@@ -16,16 +16,22 @@ import (
 type dockerLogsRunner func(ctx context.Context, args []string) (io.ReadCloser, <-chan error, error)
 
 type DockerSource struct {
-	Source    model.Source
-	Container string
-	Since     time.Time
-	Runner    dockerLogsRunner
+	Source     model.Source
+	Container  string
+	Since      time.Time
+	Runner     dockerLogsRunner
+	RetryDelay time.Duration // delay before reconnecting; 0 → 3s default
 }
 
 func (d *DockerSource) Name() string {
 	return d.Source.Path
 }
 
+// Stream ingests docker logs for d.Container and emits Lines until ctx is
+// cancelled.  When the container stops (docker logs --follow exits cleanly),
+// Stream waits 3 seconds and reconnects automatically so that a container
+// restart is transparent to the caller.  The --since flag is advanced to the
+// last-seen log timestamp on each reconnect to avoid replaying lines.
 func (d *DockerSource) Stream(ctx context.Context) (<-chan Line, <-chan error) {
 	lines := make(chan Line)
 	errs := make(chan error, 1)
@@ -34,56 +40,93 @@ func (d *DockerSource) Stream(ctx context.Context) (<-chan Line, <-chan error) {
 		defer close(lines)
 		defer close(errs)
 
-		reader, waitCh, err := d.runner()(ctx, d.commandArgs())
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				errs <- err
-			}
-			return
-		}
-		defer reader.Close()
-
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-		lineNo := 0
-		for scanner.Scan() {
-			lineNo++
-			raw := stripDockerTimestamp(scanner.Text())
-			select {
-			case lines <- Line{
-				Raw:    raw,
-				Path:   d.Source.Path,
-				Node:   d.Source.Node,
-				Role:   d.Source.Role,
-				LineNo: lineNo,
-			}:
-			case <-ctx.Done():
-				<-waitCh
+		since := d.Since
+		for {
+			lastSeen, err := d.streamOnce(ctx, since, lines)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					errs <- err
+				}
 				return
 			}
-		}
-
-		if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
-			errs <- err
-			<-waitCh
-			return
-		}
-
-		if err := <-waitCh; err != nil && !errors.Is(err, context.Canceled) {
-			errs <- err
+			// Advance since so the next connection doesn't replay old lines.
+			if !lastSeen.IsZero() {
+				since = lastSeen
+			}
+			// Stream ended cleanly (container stopped or restarted).
+			// Wait briefly then reconnect.
+			delay := d.RetryDelay
+			if delay == 0 {
+				delay = 3 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
 		}
 	}()
 
 	return lines, errs
 }
 
-func (d *DockerSource) commandArgs() []string {
+// streamOnce runs one docker-logs session. It returns the timestamp of the
+// last line received (used as --since on reconnect) and any fatal error.
+// A nil error means the stream ended cleanly; the caller should reconnect.
+func (d *DockerSource) streamOnce(ctx context.Context, since time.Time, lines chan<- Line) (lastSeen time.Time, err error) {
+	reader, waitCh, startErr := d.runner()(ctx, d.commandArgsWithSince(since))
+	if startErr != nil {
+		if errors.Is(startErr, context.Canceled) {
+			return time.Time{}, context.Canceled
+		}
+		return time.Time{}, startErr
+	}
+	defer reader.Close()
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		ts, raw := parseDockerLine(scanner.Text())
+		if !ts.IsZero() {
+			lastSeen = ts
+		}
+		select {
+		case lines <- Line{
+			Raw:    raw,
+			Path:   d.Source.Path,
+			Node:   d.Source.Node,
+			Role:   d.Source.Role,
+			LineNo: lineNo,
+		}:
+		case <-ctx.Done():
+			<-waitCh
+			return lastSeen, context.Canceled
+		}
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil && !errors.Is(scanErr, context.Canceled) {
+		<-waitCh
+		return lastSeen, scanErr
+	}
+
+	if waitErr := <-waitCh; waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		return lastSeen, waitErr
+	}
+	return lastSeen, nil
+}
+
+func (d *DockerSource) commandArgsWithSince(since time.Time) []string {
 	args := []string{"--follow", "--timestamps"}
-	if d.Since.IsZero() {
-		args = append(args, "--tail", "0")
-	} else {
+	switch {
+	case !since.IsZero():
+		args = append(args, "--since", since.UTC().Format(time.RFC3339Nano))
+	case !d.Since.IsZero():
 		args = append(args, "--since", d.Since.UTC().Format(time.RFC3339))
+	default:
+		args = append(args, "--tail", "0")
 	}
 	args = append(args, d.Container)
 	return args
@@ -119,20 +162,24 @@ func execDockerLogs(ctx context.Context, args []string) (io.ReadCloser, <-chan e
 	return pr, waitCh, nil
 }
 
-func stripDockerTimestamp(raw string) string {
+// parseDockerLine extracts the RFC3339Nano timestamp prepended by docker logs
+// --timestamps and returns (timestamp, stripped-line). If the line does not
+// carry a Docker timestamp the zero time and the original line are returned.
+func parseDockerLine(raw string) (time.Time, string) {
 	raw = strings.TrimRight(raw, "\r")
 	token, rest, ok := cutDockerToken(raw)
 	if !ok {
-		return raw
+		return time.Time{}, raw
 	}
-	if _, err := time.Parse(time.RFC3339Nano, token); err != nil {
-		return raw
+	ts, err := time.Parse(time.RFC3339Nano, token)
+	if err != nil {
+		return time.Time{}, raw
 	}
 	rest = strings.TrimLeft(rest, " \t")
 	if rest == "" {
-		return raw
+		return ts, raw
 	}
-	return rest
+	return ts, rest
 }
 
 func cutDockerToken(input string) (string, string, bool) {
