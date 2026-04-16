@@ -347,6 +347,10 @@ func loadAndMergeMetadata(paths []string) (model.Metadata, []string, error) {
 }
 
 func buildSources(cfg *inspectCfg, meta model.Metadata) ([]model.Source, error) {
+	return buildSourcesFromParams(cfg.logPaths, cfg.validatorLogs, cfg.sentryLogs, cfg.nodeBindings, cfg.roleBindings, meta)
+}
+
+func buildSourcesFromParams(logPaths, validatorLogs, sentryLogs, nodeBindings, roleBindings []string, meta model.Metadata) ([]model.Source, error) {
 	nodeByPath := map[string]string{}
 	roleByNode := map[string]model.Role{}
 	usedNames := map[string]int{}
@@ -358,7 +362,7 @@ func buildSources(cfg *inspectCfg, meta model.Metadata) ([]model.Source, error) 
 		}
 	}
 
-	for _, binding := range cfg.nodeBindings {
+	for _, binding := range nodeBindings {
 		name, path, err := splitBinding(binding)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --node value %q: %w", binding, err)
@@ -366,7 +370,7 @@ func buildSources(cfg *inspectCfg, meta model.Metadata) ([]model.Source, error) 
 		nodeByPath[parse.NormalizePath(path)] = name
 	}
 
-	for _, binding := range cfg.roleBindings {
+	for _, binding := range roleBindings {
 		name, rawRole, err := splitBinding(binding)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --role value %q: %w", binding, err)
@@ -382,14 +386,14 @@ func buildSources(cfg *inspectCfg, meta model.Metadata) ([]model.Source, error) 
 		path string
 		role model.Role
 	}
-	pending := make([]pendingSource, 0, len(cfg.logPaths)+len(cfg.validatorLogs)+len(cfg.sentryLogs))
-	for _, path := range cfg.logPaths {
+	pending := make([]pendingSource, 0, len(logPaths)+len(validatorLogs)+len(sentryLogs))
+	for _, path := range logPaths {
 		pending = append(pending, pendingSource{path: parse.NormalizePath(path), role: model.RoleUnknown})
 	}
-	for _, path := range cfg.validatorLogs {
+	for _, path := range validatorLogs {
 		pending = append(pending, pendingSource{path: parse.NormalizePath(path), role: model.RoleValidator})
 	}
-	for _, path := range cfg.sentryLogs {
+	for _, path := range sentryLogs {
 		pending = append(pending, pendingSource{path: parse.NormalizePath(path), role: model.RoleSentry})
 	}
 

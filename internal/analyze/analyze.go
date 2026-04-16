@@ -107,6 +107,10 @@ func BuildReport(input Input) model.Report {
 	return report
 }
 
+func BuildNodeSummaries(sources []model.Source, events []model.Event, peerStatsByNode map[string]NodePeerStats) []model.NodeSummary {
+	return buildNodeSummaries(sources, events, peerStatsByNode)
+}
+
 func buildValidatorSlots(genesis model.Genesis, meta model.Metadata) []model.ValidatorSlot {
 	if len(genesis.Validators) == 0 {
 		return nil

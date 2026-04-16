@@ -476,6 +476,8 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventReceivedCompletePart
 	case strings.Contains(msg, "Signed proposal"):
 		return model.EventSignedProposal
+	case strings.Contains(msg, "Signed and pushed vote"):
+		return model.EventSignedVote
 	case strings.Contains(msg, "enterPropose: Our turn to propose"),
 		strings.Contains(msg, "enterPropose: Not our turn to propose"):
 		return model.EventEnterPropose
@@ -545,8 +547,6 @@ func classifyMessage(msg string) model.EventKind {
 	case strings.Contains(msg, "setHasVote"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "addVote"):
-		return model.EventKnownNoise
-	case strings.Contains(msg, "Signed and pushed vote"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "No votes to send"):
 		return model.EventKnownNoise
@@ -726,9 +726,41 @@ func enrichEvent(event *model.Event) {
 		event.Round = extractRound(event.Message, event.Fields)
 	}
 
+	if event.Kind == model.EventSignedVote {
+		if event.Fields == nil {
+			event.Fields = map[string]any{}
+		}
+		if rawType, ok := event.Fields["type"]; ok {
+			if voteType := normalizeVoteType(rawType); voteType != "" {
+				event.Fields["_vote_type"] = voteType
+			}
+		}
+		if addr, ok := event.Fields["validator address"].(string); ok && addr != "" {
+			event.Fields["_vaddrprefix"] = voteAddrPrefix(addr)
+		}
+		if hash, ok := event.Fields["block_hash"].(string); ok && hash != "" {
+			event.Fields["_vhash"] = strings.ToUpper(hash)
+		} else {
+			event.Fields["_vhash"] = ""
+		}
+		if ts, ok := event.Fields["timestamp"].(string); ok && ts != "" {
+			if parsed, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", ts); err == nil {
+				event.Fields["_cast_at"] = parsed.UTC()
+			}
+		}
+	}
+
 	// For prevote/precommit events, parse the VoteSet string to extract vote counts,
 	// and parse the individual vote to extract validator index + block hash.
 	if event.Kind == model.EventAddedPrevote || event.Kind == model.EventAddedPrecommit {
+		if event.Fields == nil {
+			event.Fields = map[string]any{}
+		}
+		if event.Kind == model.EventAddedPrevote {
+			event.Fields["_vote_type"] = "prevote"
+		} else {
+			event.Fields["_vote_type"] = "precommit"
+		}
 		fieldName := "prevotes"
 		if event.Kind == model.EventAddedPrecommit {
 			fieldName = "precommits"
@@ -835,9 +867,10 @@ func enrichEvent(event *model.Event) {
 // the block hash that achieved majority (empty string = nil majority), and the bit array.
 //
 // TM2 majority formats:
-//   +2/3:<nil>             → no majority yet (maj23=false)
-//   +2/3::0:000000000000   → nil majority (maj23=true, maj23Hash="")
-//   +2/3:CF53223F...:1:... → block majority (maj23=true, maj23Hash=block hash)
+//
+//	+2/3:<nil>             → no majority yet (maj23=false)
+//	+2/3::0:000000000000   → nil majority (maj23=true, maj23Hash="")
+//	+2/3:CF53223F...:1:... → block majority (maj23=true, maj23Hash=block hash)
 func parseVoteSet(s string) (received, total int, maj23 bool, maj23Hash string, bits string) {
 	m := voteSetRE.FindStringSubmatch(s)
 	if m == nil {
@@ -944,6 +977,63 @@ func toInt64(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func normalizeVoteType(value any) string {
+	switch typed := value.(type) {
+	case int:
+		switch typed {
+		case 1:
+			return "prevote"
+		case 2:
+			return "precommit"
+		}
+	case int64:
+		return normalizeVoteType(int(typed))
+	case float64:
+		return normalizeVoteType(int(typed))
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "prevote":
+			return "prevote"
+		case "2", "precommit":
+			return "precommit"
+		}
+	}
+	return ""
+}
+
+func voteAddrPrefix(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if !looksLikeHex(addr) {
+		if sep := strings.LastIndexByte(addr, '1'); sep >= 1 && sep+1 < len(addr) {
+			addr = addr[sep+1:]
+		}
+	}
+	addr = strings.ToUpper(addr)
+	if len(addr) > 12 {
+		return addr[:12]
+	}
+	return addr
+}
+
+func looksLikeHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // NormalizeMessage collapses variable runtime data (heights, hashes, bit

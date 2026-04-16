@@ -2,6 +2,7 @@ package parse
 
 import (
 	"testing"
+	"time"
 
 	"github.com/D4ryl00/valdoctor/internal/model"
 	"github.com/stretchr/testify/require"
@@ -86,6 +87,23 @@ func TestParseJSONLineClassifiesProposalSigningError(t *testing.T) {
 	require.Equal(t, model.EventSignProposalError, event.Kind)
 	require.EqualValues(t, 234888, event.Height)
 	require.Equal(t, 2, event.Round)
+}
+
+func TestParseJSONLineClassifiesSignedVote(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator}
+	line := `{"level":"info","ts":1775723448.1131523,"msg":"Signed and pushed vote","module":"consensus","height":236286,"round":0,"type":1,"timestamp":"2026-04-09 08:30:47.775636368 +0000 UTC","validator address":"g1qve0yt0vt4tskhxffv27p0fatsua2um6cqr5ve","validator index":1}`
+
+	event, warning := ParseLogLine(source, line, 123)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventSignedVote, event.Kind)
+	require.EqualValues(t, 236286, event.Height)
+	require.Equal(t, 0, event.Round)
+	require.Equal(t, "prevote", event.Fields["_vote_type"])
+	require.Equal(t, "QVE0YT0VT4TS", event.Fields["_vaddrprefix"])
+	require.Equal(t, "", event.Fields["_vhash"])
+	_, ok := event.Fields["_cast_at"].(time.Time)
+	require.True(t, ok)
 }
 
 func TestParseJSONLineClassifiesPeerConfigError(t *testing.T) {

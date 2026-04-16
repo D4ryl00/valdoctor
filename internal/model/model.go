@@ -106,6 +106,7 @@ const (
 	EventApplyBlockError        EventKind = "apply_block_error"
 	EventNodeNotValidator       EventKind = "node_not_validator"
 	EventSignedProposal         EventKind = "signed_proposal"
+	EventSignedVote             EventKind = "signed_vote"
 	EventEnterPropose           EventKind = "enter_propose"
 	EventRemoteSignerFailure    EventKind = "remote_signer_failure"
 	EventRemoteSignerConnect    EventKind = "remote_signer_connected"

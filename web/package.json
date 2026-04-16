@@ -1,0 +1,24 @@
+{
+  "name": "valdoctor-live-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build --mode embedded",
+    "build:standalone": "vite build --mode standalone",
+    "preview": "vite preview --host",
+    "serve": "node server.mjs"
+  },
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^6.0.2",
+    "vite": "^6.4.2"
+  }
+}
