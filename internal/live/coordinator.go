@@ -236,8 +236,21 @@ func (c *Coordinator) refreshNodeStates() {
 	sortEvents(events)
 
 	summaries := analyze.BuildNodeSummaries(c.Sources, events, nil)
-	states := make([]model.NodeState, 0, len(summaries))
+
+	// In live mode a validator that stops logging will have StallDuration ≈ 0
+	// because BuildNodeSummaries measures stall against the node's own last event
+	// timestamp rather than the current time. Override StallDuration for any
+	// validator that is behind the chain tip so stall incidents fire correctly.
 	now := time.Now().UTC()
+	for i, summary := range summaries {
+		if summary.Role == model.RoleValidator && summary.HighestCommit < tip && !summary.LastCommitTime.IsZero() {
+			if stall := now.Sub(summary.LastCommitTime); stall > summary.StallDuration {
+				summaries[i].StallDuration = stall
+			}
+		}
+	}
+
+	states := make([]model.NodeState, 0, len(summaries))
 	for _, summary := range summaries {
 		states = append(states, model.NodeState{
 			Summary:   summary,
