@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/D4ryl00/valdoctor/internal/model"
+	"github.com/D4ryl00/valdoctor/internal/source"
 	"github.com/D4ryl00/valdoctor/internal/store"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +35,55 @@ func TestParseDockerBindingRequiresPrefix(t *testing.T) {
 
 	_, ok = parseDockerBinding("/tmp/validator.log")
 	require.False(t, ok)
+}
+
+func TestBuildLiveSourcesIncludesCmdSources(t *testing.T) {
+	cfg := &liveCfg{
+		validatorCmds: multiString{`val1=ssh user@server1 journalctl -f -u gnoland`},
+		sentryCmds:    multiString{`sentry1=ssh user@server2 tail -f /var/log/sentry.log`},
+	}
+
+	sources, err := buildLiveSources(cfg, model.Metadata{})
+	require.NoError(t, err)
+	require.Len(t, sources, 2)
+
+	byPath := map[string]model.Source{}
+	for _, s := range sources {
+		byPath[s.Path] = s
+	}
+
+	val1 := byPath[source.CmdSourcePath("val1")]
+	require.Equal(t, "val1", val1.Node)
+	require.Equal(t, model.RoleValidator, val1.Role)
+	require.True(t, source.IsCmdSourcePath(val1.Path))
+
+	s1 := byPath[source.CmdSourcePath("sentry1")]
+	require.Equal(t, "sentry1", s1.Node)
+	require.Equal(t, model.RoleSentry, s1.Role)
+}
+
+func TestParseCmdBindingsExtractsCommandSlices(t *testing.T) {
+	cmds, err := parseCmdBindings(
+		[]string{`gen=echo hello`},
+		[]string{`val1=ssh user@host journalctl -f -u gnoland`},
+		[]string{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"echo", "hello"}, cmds[source.CmdSourcePath("gen")])
+	require.Equal(t, []string{"ssh", "user@host", "journalctl", "-f", "-u", "gnoland"}, cmds[source.CmdSourcePath("val1")])
+}
+
+func TestParseCmdBindingsRejectsEmptyCommand(t *testing.T) {
+	_, err := parseCmdBindings([]string{"val1="}, nil, nil)
+	require.Error(t, err)
+	// splitBinding rejects blank values before we reach the fields-check
+	require.Contains(t, err.Error(), "val1=")
+}
+
+func TestParseCmdBindingsRejectsMissingName(t *testing.T) {
+	_, err := parseCmdBindings([]string{"just-a-cmd-no-equals"}, nil, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expected <name>=<command>")
 }
 
 func TestOpenLiveStoreUsesSQLiteWhenDBConfigured(t *testing.T) {

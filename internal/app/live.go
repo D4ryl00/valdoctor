@@ -32,6 +32,9 @@ type liveCfg struct {
 	dockerSources    multiString
 	validatorDocker  multiString
 	sentryDocker     multiString
+	cmdSources       multiString
+	validatorCmds    multiString
+	sentryCmds       multiString
 	metadataPaths    multiString
 	nodeBindings     multiString
 	roleBindings     multiString
@@ -71,6 +74,9 @@ func (c *liveCfg) RegisterFlags(fs *flag.FlagSet) {
 	fs.Var(&c.dockerSources, "docker", "generic Docker container name or ID; may be repeated")
 	fs.Var(&c.validatorDocker, "validator-docker", "validator Docker container name or ID; may be repeated")
 	fs.Var(&c.sentryDocker, "sentry-docker", "sentry Docker container name or ID; may be repeated")
+	fs.Var(&c.cmdSources, "cmd", "generic external command as <name>=<cmd> (e.g. \"val1=ssh user@host tail -f /var/log/gnoland.log\"); may be repeated")
+	fs.Var(&c.validatorCmds, "validator-cmd", "validator external command as <name>=<cmd>; may be repeated")
+	fs.Var(&c.sentryCmds, "sentry-cmd", "sentry external command as <name>=<cmd>; may be repeated")
 	fs.Var(&c.metadataPaths, "metadata", "TOML metadata file path; may be repeated")
 	fs.Var(&c.nodeBindings, "node", "bind a node name to a log path or docker source as <name>=<path|docker:container>")
 	fs.Var(&c.roleBindings, "role", "assign a role to a node as <name>=<role>")
@@ -126,17 +132,30 @@ func execLive(ctx context.Context, cfg *liveCfg, io commands.IO) error {
 		return err
 	}
 
+	// Build a lookup from cmd source path → command slice so we can instantiate
+	// CmdSource with the right argv when iterating over resolved sources below.
+	cmdByPath, err := parseCmdBindings(cfg.cmdSources, cfg.validatorCmds, cfg.sentryCmds)
+	if err != nil {
+		return err
+	}
+
 	logSources := make([]source.LogSource, 0, len(sources))
 	validatorSources := make([]string, 0)
 	seenValidators := map[string]struct{}{}
 	for _, src := range sources {
-		if isDockerSourcePath(src.Path) {
+		switch {
+		case isDockerSourcePath(src.Path):
 			logSources = append(logSources, &source.DockerSource{
 				Source:    src,
 				Container: dockerContainerFromSourcePath(src.Path),
 				Since:     since,
 			})
-		} else {
+		case source.IsCmdSourcePath(src.Path):
+			logSources = append(logSources, &source.CmdSource{
+				Source: src,
+				Cmd:    cmdByPath[src.Path],
+			})
+		default:
 			logSources = append(logSources, &source.FileSource{
 				Source: src,
 				Since:  since,
@@ -239,6 +258,30 @@ func openLiveStore(cfg *liveCfg) (store.Store, func(), error) {
 	}, nil
 }
 
+// parseCmdBindings extracts the command slices from the raw flag values and
+// returns a map of source.CmdSourcePath(name) → []string{cmd, arg1, arg2, ...}.
+// It is a pure parsing helper — role/metadata resolution is done by buildCmdSources.
+func parseCmdBindings(generic, validators, sentries []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	all := append(append(append([]string(nil), generic...), validators...), sentries...)
+	for _, raw := range all {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		name, rawCmd, err := splitBinding(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cmd source %q: expected <name>=<command>", raw)
+		}
+		words := strings.Fields(rawCmd)
+		if len(words) == 0 {
+			return nil, fmt.Errorf("invalid cmd source %q: command must not be empty", raw)
+		}
+		out[source.CmdSourcePath(name)] = words
+	}
+	return out, nil
+}
+
 func parseClosurePolicy(raw string) (model.ClosurePolicy, error) {
 	switch strings.TrimSpace(raw) {
 	case "", "single_validator_commit":
@@ -263,7 +306,13 @@ func buildLiveSources(cfg *liveCfg, meta model.Metadata) ([]model.Source, error)
 		return nil, err
 	}
 
+	cmdSources, err := buildCmdSources(cfg.cmdSources, cfg.validatorCmds, cfg.sentryCmds, cfg.roleBindings, meta)
+	if err != nil {
+		return nil, err
+	}
+
 	sources := append(fileSources, dockerSources...)
+	sources = append(sources, cmdSources...)
 	sort.Slice(sources, func(i, j int) bool {
 		return sources[i].Path < sources[j].Path
 	})
@@ -357,6 +406,91 @@ func buildDockerSources(generic, validators, sentries, nodeBindings, roleBinding
 			if mapped, ok := roleByNode[src.Node]; ok {
 				src.Role = mapped
 			}
+		}
+		seen[path] = src
+	}
+
+	sources := make([]model.Source, 0, len(seen))
+	for _, src := range seen {
+		sources = append(sources, src)
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].Path < sources[j].Path
+	})
+	return sources, nil
+}
+
+// buildCmdSources resolves model.Source descriptors for external command sources.
+// Each entry in generic/validators/sentries must be of the form "name=cmd arg1 arg2..."
+// where everything after the first '=' is split on whitespace to form the command slice.
+func buildCmdSources(generic, validators, sentries, roleBindings []string, meta model.Metadata) ([]model.Source, error) {
+	roleByNode := map[string]model.Role{}
+	for name, node := range meta.Nodes {
+		roleByNode[name] = model.ParseRole(node.Role)
+	}
+	for _, binding := range roleBindings {
+		name, rawRole, err := splitBinding(binding)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --role value %q: %w", binding, err)
+		}
+		role := model.ParseRole(rawRole)
+		if role == model.RoleUnknown && rawRole != string(model.RoleUnknown) {
+			return nil, fmt.Errorf("invalid role %q", rawRole)
+		}
+		roleByNode[name] = role
+	}
+
+	type pendingCmd struct {
+		raw  string
+		role model.Role
+	}
+	pending := make([]pendingCmd, 0, len(generic)+len(validators)+len(sentries))
+	for _, v := range generic {
+		pending = append(pending, pendingCmd{raw: strings.TrimSpace(v), role: model.RoleUnknown})
+	}
+	for _, v := range validators {
+		pending = append(pending, pendingCmd{raw: strings.TrimSpace(v), role: model.RoleValidator})
+	}
+	for _, v := range sentries {
+		pending = append(pending, pendingCmd{raw: strings.TrimSpace(v), role: model.RoleSentry})
+	}
+
+	seen := map[string]model.Source{}
+	for _, item := range pending {
+		if item.raw == "" {
+			continue
+		}
+		name, rawCmd, err := splitBinding(item.raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cmd source %q: expected <name>=<command>", item.raw)
+		}
+		if rawCmd == "" {
+			return nil, fmt.Errorf("invalid cmd source %q: command must not be empty", item.raw)
+		}
+		path := source.CmdSourcePath(name)
+		src, ok := seen[path]
+		if !ok {
+			role := item.role
+			if role == model.RoleUnknown {
+				if mapped, ok := roleByNode[name]; ok {
+					role = mapped
+				}
+			}
+			if role == model.RoleUnknown {
+				if metaNode, ok := meta.Nodes[name]; ok {
+					role = model.ParseRole(metaNode.Role)
+				}
+			}
+			src = model.Source{
+				Path:         path,
+				Node:         name,
+				Role:         role,
+				ExplicitNode: true,
+				ExplicitRole: item.role != model.RoleUnknown,
+			}
+		} else if src.Role == model.RoleUnknown && item.role != model.RoleUnknown {
+			src.Role = item.role
+			src.ExplicitRole = true
 		}
 		seen[path] = src
 	}
