@@ -16,7 +16,8 @@ type receiverRoundKey struct {
 }
 
 type receiverRoundState struct {
-	maj23 bool
+	maj23   bool
+	maj23At time.Time
 }
 
 func BuildPropagation(
@@ -35,6 +36,14 @@ func BuildPropagation(
 	for _, receiver := range expectedReceivers {
 		expected[receiver] = struct{}{}
 	}
+
+	type rtiKey struct {
+		round    int
+		voteType string
+		index    int
+	}
+	rowByRTI := map[rtiKey]map[string]*model.VoteReceipt{}
+	keyByRTI := map[rtiKey]model.VoteKey{}
 
 	for _, event := range events {
 		if event.Height != h {
@@ -55,6 +64,11 @@ func BuildPropagation(
 			if receiver == key.OriginNode {
 				receipt.ReceivedAt = castAt
 			}
+		}
+		if idx, ok := event.Fields["_vidx"].(int); ok && idx >= 0 {
+			rtik := rtiKey{round: event.Round, voteType: key.VoteType, index: idx}
+			rowByRTI[rtik] = row
+			keyByRTI[rtik] = key
 		}
 	}
 
@@ -83,10 +97,21 @@ func BuildPropagation(
 		state := receiverRounds[roundKey]
 		if maj23, _ := event.Fields["_vmaj23"].(bool); maj23 {
 			state.maj23 = true
+			if !event.Timestamp.IsZero() && (state.maj23At.IsZero() || event.Timestamp.Before(state.maj23At)) {
+				state.maj23At = event.Timestamp
+			}
 		}
 		receiverRounds[roundKey] = state
 
 		key, receivedAt, ok := receivedVoteKey(event, resolver)
+		row := map[string]*model.VoteReceipt(nil)
+		if idx, hasIdx := event.Fields["_vidx"].(int); hasIdx && idx >= 0 {
+			if mappedRow, found := rowByRTI[rtiKey{round: event.Round, voteType: voteType, index: idx}]; found {
+				row = mappedRow
+				key = keyByRTI[rtiKey{round: event.Round, voteType: voteType, index: idx}]
+				ok = true
+			}
+		}
 		if !ok {
 			// Event lacks per-vote detail (e.g. gnoland debug logs only carry the
 			// VoteSet BitArray, not individual vote origin). Don't mark this node
@@ -97,7 +122,9 @@ func BuildPropagation(
 		// Only count as "has data" when we can actually resolve the vote origin.
 		receiversWithData[event.Node] = true
 
-		row := ensurePropagationRow(prop.Matrix, key, expectedReceivers)
+		if row == nil {
+			row = ensurePropagationRow(prop.Matrix, key, expectedReceivers)
+		}
 		receipt, tracked := row[event.Node]
 		if !tracked {
 			if _, wanted := expected[event.Node]; !wanted {
@@ -160,7 +187,26 @@ func BuildPropagation(
 				if i < len(prev) && prev[i] == 'x' {
 					continue // already seen in an earlier snapshot
 				}
-				originName := resolver.ResolveByGenesisIndex(i)
+				originName := ""
+				if row, ok := rowByRTI[rtiKey{round: ev.Round, voteType: voteType, index: i}]; ok {
+					if key, found := keyByRTI[rtiKey{round: ev.Round, voteType: voteType, index: i}]; found {
+						originName = key.OriginNode
+						receipt, ok := row[ev.Node]
+						if !ok {
+							if _, wanted := expected[ev.Node]; !wanted {
+								continue
+							}
+							receipt = &model.VoteReceipt{}
+							row[ev.Node] = receipt
+						}
+						if receipt.ReceivedAt.IsZero() || ev.Timestamp.Before(receipt.ReceivedAt) {
+							receipt.ReceivedAt = ev.Timestamp
+						}
+						receiversWithData[ev.Node] = true
+						continue
+					}
+				}
+				originName = resolver.ResolveByGenesisIndex(i)
 				if originName == "" || originName == ev.Node {
 					continue // self-receipt or unresolvable
 				}
@@ -186,6 +232,11 @@ func BuildPropagation(
 
 	for key, row := range prop.Matrix {
 		for receiver, receipt := range row {
+			roundState := receiverRounds[receiverRoundKey{
+				receiver: receiver,
+				round:    key.Round,
+				voteType: key.VoteType,
+			}]
 			switch {
 			case receipt.CastAt.IsZero():
 				receipt.Status = "unknown_cast_time"
@@ -195,16 +246,13 @@ func BuildPropagation(
 				// absent. If the receiver has no receipt events at all, the log level is
 				// too low to draw conclusions.
 				if gracePassed && receiversWithData[receiver] {
-					if key.VoteType == "precommit" && receiverRounds[receiverRoundKey{
-						receiver: receiver,
-						round:    key.Round,
-						voteType: key.VoteType,
-					}].maj23 {
+					if roundState.maj23 {
 						// Once the receiver already logged +2/3 precommits for the round,
-						// an extra precommit that never appears in the logs is not a
-						// reliable propagation miss signal: TM2 often commits immediately
-						// after quorum and never emits a per-vote receipt for the surplus
-						// validator. Keep it visible in the matrix, but suppress incidents.
+						// or +2/3 prevotes that advance the round, an extra receipt that
+						// never appears in the logs is not a reliable propagation miss
+						// signal: TM2 often moves on immediately after quorum and never
+						// emits a per-vote receipt for the surplus validator. Keep it
+						// visible in the matrix, but suppress incidents.
 						receipt.Status = "quorum-satisfied"
 						break
 					}
@@ -221,6 +269,14 @@ func BuildPropagation(
 					latency = 0
 				}
 				receipt.Latency = latency
+				if roundState.maj23 && !roundState.maj23At.IsZero() && !roundState.maj23At.After(receipt.ReceivedAt) {
+					// BitArray-based receipt inference often lands on or after the same
+					// snapshot that already showed quorum. That is enough to reconstruct
+					// the round outcome, but not enough to claim a meaningful
+					// propagation delay for this specific vote.
+					receipt.Status = "quorum-satisfied"
+					break
+				}
 				if latency >= propagationLateThreshold {
 					receipt.Status = "late"
 				} else {

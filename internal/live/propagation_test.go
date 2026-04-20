@@ -265,3 +265,262 @@ func TestBuildPropagationSuppressesSurplusPrecommitMissAfterMaj23(t *testing.T) 
 	require.Equal(t, "quorum-satisfied", prop.Matrix[key]["val1"].Status)
 	require.Equal(t, "ok", prop.Matrix[key]["val4"].Status)
 }
+
+func TestBuildPropagationSuppressesPrevoteMissAfterMaj23(t *testing.T) {
+	resolver := &IdentityResolver{
+		Genesis: model.Genesis{
+			Validators: []model.Validator{
+				{Name: "val1"},
+				{Name: "val2"},
+				{Name: "val3"},
+				{Name: "val4"},
+			},
+		},
+		Sources: []model.Source{
+			{Node: "val1", Role: model.RoleValidator},
+			{Node: "val2", Role: model.RoleValidator},
+			{Node: "val3", Role: model.RoleValidator},
+			{Node: "val4", Role: model.RoleValidator},
+		},
+	}
+
+	base := time.Date(2026, 4, 20, 16, 35, 5, 0, time.UTC)
+	events := []model.Event{
+		{
+			Node:         "val4",
+			Height:       215,
+			Round:        1,
+			Kind:         model.EventSignedVote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(4 * time.Second),
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_cast_at":   base.Add(4 * time.Second),
+			},
+		},
+		{
+			Node:         "val1",
+			Height:       215,
+			Round:        1,
+			Kind:         model.EventAddedPrevote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(4*time.Second + 200*time.Millisecond),
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_vaddrprefix": "VAL2",
+				"_vbits":     "xxx_",
+				"_vrecv":     3,
+				"_vtotal":    4,
+				"_vmaj23":    true,
+			},
+		},
+	}
+
+	prop := BuildPropagation(events, 215, resolver, []string{"val1", "val2", "val3", "val4"}, true)
+
+	key := model.VoteKey{Height: 215, Round: 1, VoteType: "prevote", OriginNode: "val4", OriginShortAddr: "VAL4"}
+	require.Equal(t, "quorum-satisfied", prop.Matrix[key]["val1"].Status)
+	require.Equal(t, "ok", prop.Matrix[key]["val4"].Status)
+}
+
+func TestBuildPropagationSuppressesLatePrevoteReceiptAfterMaj23(t *testing.T) {
+	resolver := &IdentityResolver{
+		Genesis: model.Genesis{
+			Validators: []model.Validator{
+				{Name: "val1"},
+				{Name: "val2"},
+				{Name: "val3"},
+				{Name: "val4"},
+			},
+		},
+		Sources: []model.Source{
+			{Node: "val1", Role: model.RoleValidator},
+			{Node: "val2", Role: model.RoleValidator},
+			{Node: "val3", Role: model.RoleValidator},
+			{Node: "val4", Role: model.RoleValidator},
+		},
+	}
+
+	base := time.Date(2026, 4, 20, 16, 35, 5, 0, time.UTC)
+	events := []model.Event{
+		{
+			Node:         "val4",
+			Height:       215,
+			Round:        0,
+			Kind:         model.EventSignedVote,
+			HasTimestamp: true,
+			Timestamp:    base,
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_cast_at":   base,
+			},
+		},
+		{
+			Node:         "val1",
+			Height:       215,
+			Round:        0,
+			Kind:         model.EventAddedPrevote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(800 * time.Millisecond),
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_vbits":     "xxx_",
+				"_vrecv":     3,
+				"_vtotal":    4,
+				"_vmaj23":    true,
+			},
+		},
+		{
+			Node:         "val1",
+			Height:       215,
+			Round:        0,
+			Kind:         model.EventAddedPrevote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(1300 * time.Millisecond),
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_vbits":     "xxxx",
+				"_vrecv":     4,
+				"_vtotal":    4,
+				"_vmaj23":    true,
+			},
+		},
+	}
+
+	prop := BuildPropagation(events, 215, resolver, []string{"val1", "val2", "val3", "val4"}, true)
+
+	key := model.VoteKey{Height: 215, Round: 0, VoteType: "prevote", OriginNode: "val4", OriginShortAddr: "VAL4"}
+	require.Equal(t, "quorum-satisfied", prop.Matrix[key]["val1"].Status)
+	require.Equal(t, 1300*time.Millisecond, prop.Matrix[key]["val1"].Latency)
+	require.Equal(t, "ok", prop.Matrix[key]["val4"].Status)
+}
+
+func TestBuildPropagationMergesReceiveVotesBySignedVoteIndex(t *testing.T) {
+	resolver := &IdentityResolver{
+		Genesis: model.Genesis{
+			Validators: []model.Validator{
+				{Name: "val1"},
+				{Name: "val2"},
+			},
+		},
+		Sources: []model.Source{
+			{Node: "val1", Role: model.RoleValidator},
+			{Node: "val2", Role: model.RoleValidator},
+		},
+	}
+
+	base := time.Date(2026, 4, 20, 21, 43, 13, 0, time.UTC)
+	events := []model.Event{
+		{
+			Node:         "val1",
+			Height:       160,
+			Round:        0,
+			Kind:         model.EventSignedVote,
+			HasTimestamp: true,
+			Timestamp:    base,
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_cast_at":   base,
+				"_vidx":      0,
+			},
+		},
+		{
+			Node:         "val2",
+			Height:       160,
+			Round:        0,
+			Kind:         model.EventAddedPrevote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(100 * time.Millisecond),
+			Fields: map[string]any{
+				"_vote_type":   "prevote",
+				"_vidx":        0,
+				"_vaddrprefix": "0C0D31644548",
+			},
+		},
+	}
+
+	prop := BuildPropagation(events, 160, resolver, []string{"val1", "val2"}, true)
+
+	key := model.VoteKey{Height: 160, Round: 0, VoteType: "prevote", OriginNode: "val1", OriginShortAddr: "VAL1"}
+	require.Contains(t, prop.Matrix, key)
+	require.Equal(t, "ok", prop.Matrix[key]["val1"].Status)
+	require.Equal(t, "ok", prop.Matrix[key]["val2"].Status)
+	for candidate := range prop.Matrix {
+		require.NotEqual(t, "0C0D31644548", candidate.OriginNode)
+	}
+}
+
+func TestBuildPropagationBitArrayPrefersSignedVoteRuntimeIndex(t *testing.T) {
+	resolver := &IdentityResolver{
+		Genesis: model.Genesis{
+			Validators: []model.Validator{
+				{Name: "val1"},
+				{Name: "val2"},
+				{Name: "val3"},
+				{Name: "val4"},
+				{Name: "val5"},
+			},
+		},
+		Sources: []model.Source{
+			{Node: "val1", Role: model.RoleValidator},
+			{Node: "val2", Role: model.RoleValidator},
+			{Node: "val3", Role: model.RoleValidator},
+			{Node: "val4", Role: model.RoleValidator},
+			{Node: "val5", Role: model.RoleValidator},
+		},
+	}
+
+	base := time.Date(2026, 4, 20, 21, 43, 23, 0, time.UTC)
+	events := []model.Event{
+		{
+			Node:         "val5",
+			Height:       160,
+			Round:        0,
+			Kind:         model.EventSignedVote,
+			HasTimestamp: true,
+			Timestamp:    base,
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_cast_at":   base,
+				"_vidx":      3,
+			},
+		},
+		{
+			Node:         "val4",
+			Height:       160,
+			Round:        0,
+			Kind:         model.EventSignedVote,
+			HasTimestamp: true,
+			Timestamp:    base,
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_cast_at":   base,
+				"_vidx":      4,
+			},
+		},
+		{
+			Node:         "val3",
+			Height:       160,
+			Round:        0,
+			Kind:         model.EventAddedPrevote,
+			HasTimestamp: true,
+			Timestamp:    base.Add(150 * time.Millisecond),
+			Fields: map[string]any{
+				"_vote_type": "prevote",
+				"_vbits":     "___xx",
+				"_vrecv":     2,
+				"_vtotal":    5,
+				"_vmaj23":    false,
+			},
+		},
+	}
+
+	prop := BuildPropagation(events, 160, resolver, []string{"val1", "val2", "val3", "val4", "val5"}, true)
+
+	keyVal5 := model.VoteKey{Height: 160, Round: 0, VoteType: "prevote", OriginNode: "val5", OriginShortAddr: "VAL5"}
+	keyVal4 := model.VoteKey{Height: 160, Round: 0, VoteType: "prevote", OriginNode: "val4", OriginShortAddr: "VAL4"}
+	require.Equal(t, "ok", prop.Matrix[keyVal5]["val3"].Status)
+	require.Equal(t, 150*time.Millisecond, prop.Matrix[keyVal5]["val3"].Latency)
+	require.Equal(t, "ok", prop.Matrix[keyVal4]["val3"].Status)
+	require.Equal(t, 150*time.Millisecond, prop.Matrix[keyVal4]["val3"].Latency)
+}

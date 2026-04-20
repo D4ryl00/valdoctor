@@ -11,7 +11,7 @@ func keyHelp(mode viewMode, searching, showHelp, confirmQuit bool) string {
 		return "↑/↓ or j/k scroll  ·  PgUp/PgDn page  ·  h or Esc close help  ·  q quit"
 	}
 	if mode == viewDetail {
-		return "n/p recent heights  ·  Tab switch tab  ·  ↑/↓ or j/k scroll  ·  b or Esc back  ·  / search  ·  f severity filter  ·  Space pause  ·  h help  ·  q quit"
+		return "n newer / p older  ·  N follow latest  ·  P oldest  ·  Tab switch tab  ·  ↑/↓ or j/k scroll  ·  b or Esc back  ·  / search  ·  f severity filter  ·  Space pause  ·  h help  ·  q quit"
 	}
 
 	if mode == viewDashboard {

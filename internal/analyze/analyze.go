@@ -379,6 +379,7 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 
 func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []model.Event, warnings []string, meta model.Metadata) []model.Finding {
 	findings := make([]model.Finding, 0)
+	grouped := groupEventsByNode(events)
 
 	if genesis.ValidatorNum == 0 {
 		findings = append(findings, model.Finding{
@@ -452,7 +453,8 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			})
 		}
 
-		if node.MaxPeers > 0 && node.CurrentPeers == 0 && node.TimeoutCount > 0 {
+		if node.MaxPeers > 0 && node.CurrentPeers == 0 && node.TimeoutCount > 0 &&
+			!nodeGracefullyStoppedNearEnd(grouped[node.Name], node.End) {
 			findings = append(findings, model.Finding{
 				ID:         "peer-starvation-" + node.Name,
 				Title:      fmt.Sprintf("Peer starvation on %s", node.Name),
@@ -594,7 +596,6 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 		nodeSummaries[n.Name] = n
 	}
 
-	grouped := groupEventsByNode(events)
 	for node, nodeEvents := range grouped {
 		// Config errors — emitted before the first structured log line.
 		if count := countByKind(nodeEvents, model.EventConfigError); count > 0 {
@@ -655,14 +656,11 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			})
 		}
 
-		if count := countByKind(nodeEvents, model.EventConsensusWALIssue); count > 0 {
+		if walEvents := significantConsensusWALEvents(nodeEvents); len(walEvents) > 0 {
 			replayIssue := false
 			corruptionIssue := false
 			writeIssue := false
-			for _, e := range nodeEvents {
-				if e.Kind != model.EventConsensusWALIssue {
-					continue
-				}
+			for _, e := range walEvents {
 				switch {
 				case strings.Contains(e.Message, "catchup replay"):
 					replayIssue = true
@@ -679,7 +677,7 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 			}
 
 			sev := model.SeverityHigh
-			summary := fmt.Sprintf("%d consensus WAL issue(s) were logged.", count)
+			summary := fmt.Sprintf("%d consensus WAL issue(s) were logged.", len(walEvents))
 			possibleCauses := []string{
 				"unclean shutdown or crash left the consensus WAL incomplete",
 				"disk or filesystem error prevented WAL data from being flushed durably",
@@ -714,7 +712,7 @@ func buildFindings(genesis model.Genesis, nodes []model.NodeSummary, events []mo
 				Confidence:       model.ConfidenceHigh,
 				Scope:            node,
 				Summary:          summary,
-				Evidence:         firstEvidence(nodeEvents, model.EventConsensusWALIssue, 3),
+				Evidence:         evidenceFromEvents(walEvents, 3),
 				PossibleCauses:   possibleCauses,
 				SuggestedActions: suggestedActions,
 			})
@@ -2423,12 +2421,73 @@ func countByKind(events []model.Event, kind model.EventKind) int {
 	return count
 }
 
+func isBenignInitialCatchupReplay(event model.Event) bool {
+	if event.Kind != model.EventConsensusWALIssue {
+		return false
+	}
+	if !strings.Contains(event.Message, "Error on catchup replay. Proceeding to start ConsensusState anyway") {
+		return false
+	}
+	errStr, _ := event.Fields["err"].(string)
+	return strings.Contains(errStr, "cannot replay height 1.") &&
+		strings.Contains(errStr, "WAL does not contain #ENDHEIGHT for 0")
+}
+
+func significantConsensusWALEvents(events []model.Event) []model.Event {
+	filtered := make([]model.Event, 0, len(events))
+	for _, event := range events {
+		if event.Kind != model.EventConsensusWALIssue {
+			continue
+		}
+		if isBenignInitialCatchupReplay(event) {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	return filtered
+}
+
+func nodeGracefullyStoppedNearEnd(events []model.Event, end time.Time) bool {
+	if end.IsZero() {
+		return false
+	}
+	const shutdownGrace = 5 * time.Second
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if event.Kind != model.EventNodeShutdown {
+			continue
+		}
+		if !event.HasTimestamp {
+			return true
+		}
+		return end.Sub(event.Timestamp) <= shutdownGrace
+	}
+	return false
+}
+
 func firstEvidence(events []model.Event, kind model.EventKind, limit int) []model.Evidence {
 	out := make([]model.Evidence, 0, limit)
 	for _, event := range events {
 		if event.Kind != kind {
 			continue
 		}
+		out = append(out, model.Evidence{
+			Node:      event.Node,
+			Timestamp: formatMaybeTime(event.Timestamp),
+			Path:      event.Path,
+			Line:      event.Line,
+			Message:   event.Message,
+		})
+		if len(out) == limit {
+			break
+		}
+	}
+	return out
+}
+
+func evidenceFromEvents(events []model.Event, limit int) []model.Evidence {
+	out := make([]model.Evidence, 0, limit)
+	for _, event := range events {
 		out = append(out, model.Evidence{
 			Node:      event.Node,
 			Timestamp: formatMaybeTime(event.Timestamp),

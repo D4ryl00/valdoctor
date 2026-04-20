@@ -29,7 +29,7 @@ func blockUntilCancelled() func(runCtx context.Context, args []string) (io.ReadC
 	}
 }
 
-func TestDockerSourceDefaultUsesTailZeroAndStripsOuterTimestamp(t *testing.T) {
+func TestDockerSourceDefaultBootstrapsRecentBacklogAndStripsOuterTimestamp(t *testing.T) {
 	const payload = "2026-04-16T10:00:00.000000000Z {\"level\":\"info\",\"ts\":1776333600,\"msg\":\"Finalizing commit of block\",\"height\":10}\n"
 
 	var gotArgs []string
@@ -76,7 +76,7 @@ func TestDockerSourceDefaultUsesTailZeroAndStripsOuterTimestamp(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, []string{"--follow", "--timestamps", "--tail", "0", "validator-a"}, gotArgs)
+	require.Equal(t, []string{"--follow", "--timestamps", "--tail", defaultDockerBootstrapTail, "validator-a"}, gotArgs)
 	require.Equal(t, `{"level":"info","ts":1776333600,"msg":"Finalizing commit of block","height":10}`, line.Raw)
 	require.Equal(t, "docker:validator-a", line.Path)
 }

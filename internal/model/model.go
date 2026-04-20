@@ -133,6 +133,7 @@ const (
 	EventNodeIsValidator        EventKind = "node_is_validator"
 	EventRemoteSignerSuccess    EventKind = "remote_signer_success"
 	EventPrevoteProposalInvalid EventKind = "prevote_proposal_invalid"
+	EventNodeShutdown           EventKind = "node_shutdown"
 	// EventKnownNoise marks messages that are recognised from the gno source
 	// but carry no diagnostic value. They are dropped immediately — not stored
 	// and not counted in the unclassified frequency table.
@@ -231,8 +232,8 @@ type PeerRoundState struct {
 }
 
 type NodeSummary struct {
-	Name           string     `json:"name"`
-	ShortAddr      string     `json:"short_addr,omitempty"`
+	Name      string `json:"name"`
+	ShortAddr string `json:"short_addr,omitempty"`
 	// GenesisIndex is the validator's position in the genesis validator set (0-based).
 	// -1 means not in genesis / unknown. Used for consistent cross-view ordering.
 	GenesisIndex   int        `json:"genesis_index"`

@@ -85,6 +85,10 @@ func TestModelEnterOpensDetailAndPauseDefersRefresh(t *testing.T) {
 
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	m = next.(Model)
+	require.EqualValues(t, 10, m.selectedHeight)
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = next.(Model)
 	require.EqualValues(t, 9, m.selectedHeight)
 
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
@@ -103,6 +107,91 @@ func TestModelEnterOpensDetailAndPauseDefersRefresh(t *testing.T) {
 	m = next.(Model)
 	require.False(t, m.paused)
 	require.EqualValues(t, 11, m.snap.tip)
+}
+
+func TestModelDetailFollowLatestTracksNewHeights(t *testing.T) {
+	memStore := store.NewMemoryStore(8)
+	now := time.Now().UTC()
+	memStore.SetHeightEntry(model.HeightEntry{Height: 10, Report: model.HeightReport{Height: 10, ChainID: "test-chain"}, LastUpdated: now})
+	memStore.SetHeightEntry(model.HeightEntry{Height: 9, Report: model.HeightReport{Height: 9, ChainID: "test-chain"}, LastUpdated: now})
+	memStore.SetTip(10)
+
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+	m.width = 120
+	m.height = 40
+	m.resizeViewport()
+	m.mode = viewDetail
+	m.jumpToLatestHeight()
+
+	require.True(t, m.followLatest)
+	require.EqualValues(t, 10, m.selectedHeight)
+
+	memStore.SetHeightEntry(model.HeightEntry{Height: 11, Report: model.HeightReport{Height: 11, ChainID: "test-chain"}, LastUpdated: now})
+	memStore.SetTip(11)
+
+	next, _ := m.Update(storeUpdatedMsg{})
+	m = next.(Model)
+	require.True(t, m.followLatest)
+	require.EqualValues(t, 11, m.selectedHeight)
+	require.EqualValues(t, 11, m.snap.tip)
+}
+
+func TestModelDetailNavigationStopsFollowingLatest(t *testing.T) {
+	memStore := store.NewMemoryStore(8)
+	now := time.Now().UTC()
+	for _, h := range []int64{10, 9, 8} {
+		memStore.SetHeightEntry(model.HeightEntry{Height: h, Report: model.HeightReport{Height: h, ChainID: "test-chain"}, LastUpdated: now})
+	}
+	memStore.SetTip(10)
+
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+	m.width = 120
+	m.height = 40
+	m.resizeViewport()
+	m.mode = viewDetail
+	m.jumpToLatestHeight()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = next.(Model)
+	require.False(t, m.followLatest)
+	require.EqualValues(t, 9, m.selectedHeight)
+
+	memStore.SetHeightEntry(model.HeightEntry{Height: 11, Report: model.HeightReport{Height: 11, ChainID: "test-chain"}, LastUpdated: now})
+	memStore.SetTip(11)
+
+	next, _ = m.Update(storeUpdatedMsg{})
+	m = next.(Model)
+	require.False(t, m.followLatest)
+	require.EqualValues(t, 9, m.selectedHeight)
+	require.EqualValues(t, 11, m.snap.tip)
+}
+
+func TestModelPinnedDetailHeightEventKeepsSelectionWhileTipAdvances(t *testing.T) {
+	memStore := store.NewMemoryStore(8)
+	now := time.Now().UTC()
+	for _, h := range []int64{160, 159, 158} {
+		memStore.SetHeightEntry(model.HeightEntry{Height: h, Report: model.HeightReport{Height: h, ChainID: "test-chain"}, LastUpdated: now})
+	}
+	memStore.SetTip(160)
+
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+	m.width = 120
+	m.height = 40
+	m.resizeViewport()
+	m.mode = viewDetail
+	m.selectedHeight = 159
+	m.followLatest = false
+	m.refreshViewport()
+
+	memStore.SetHeightEntry(model.HeightEntry{Height: 161, Report: model.HeightReport{Height: 161, ChainID: "test-chain"}, LastUpdated: now})
+	memStore.SetTip(161)
+
+	next, _ := m.Update(storeEventMsg{event: store.StoreEvent{Kind: "height_updated", Height: 161}})
+	m = next.(Model)
+	require.False(t, m.followLatest)
+	require.EqualValues(t, 159, m.selectedHeight)
+	require.EqualValues(t, 161, m.snap.tip)
+	require.EqualValues(t, 161, m.snap.recentHeights[0].Height)
 }
 
 func TestModelHelpViewScrolls(t *testing.T) {

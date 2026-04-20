@@ -30,6 +30,9 @@ const (
 )
 
 type storeUpdatedMsg struct{}
+type storeEventMsg struct {
+	event storepkg.StoreEvent
+}
 
 type coordinatorErrMsg struct {
 	err error
@@ -80,6 +83,7 @@ type Model struct {
 
 	incidentSelection int
 	selectedHeight    int64
+	followLatest      bool
 
 	viewport viewport.Model
 	snap     snapshot
@@ -108,11 +112,11 @@ func Run(ctx context.Context, opts Options) error {
 			select {
 			case <-ctx.Done():
 				return
-			case _, ok := <-subscription:
+			case event, ok := <-subscription:
 				if !ok {
 					return
 				}
-				program.Send(storeUpdatedMsg{})
+				program.Send(storeEventMsg{event: event})
 			}
 		}
 	}()
@@ -176,6 +180,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.reloadSnapshot()
+		return m, nil
+	case storeEventMsg:
+		if m.paused {
+			m.dirty = true
+			return m, nil
+		}
+		m.applyStoreEvent(msg.event)
 		return m, nil
 	case coordinatorErrMsg:
 		m.err = msg.err
@@ -349,11 +360,13 @@ func (m *Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = viewDetail
 			m.detailTab = tabConsensus
 			m.selectedHeight = items[m.incidentSelection].card.LastHeight
+			m.followLatest = false
 			m.refreshViewport()
 		} else if len(m.snap.recentHeights) > 0 {
 			m.mode = viewDetail
 			m.detailTab = tabConsensus
 			m.selectedHeight = m.snap.recentHeights[0].Height
+			m.followLatest = true
 			m.refreshViewport()
 		}
 	}
@@ -365,6 +378,7 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "b":
 		m.mode = viewDashboard
+		m.followLatest = false
 		return *m, nil
 	case "tab":
 		if m.detailTab == tabConsensus {
@@ -374,9 +388,13 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 	case "n":
-		m.navigateHeight(1)
-	case "p":
 		m.navigateHeight(-1)
+	case "p":
+		m.navigateHeight(1)
+	case "N":
+		m.jumpToLatestHeight()
+	case "P":
+		m.jumpToOldestHeight()
 	case "j", "down":
 		m.viewport.LineDown(1)
 	case "k", "up":
@@ -395,7 +413,7 @@ func (m *Model) reloadSnapshot() {
 		recentHeights:     m.store.RecentHeights(32),
 	}
 
-	if m.selectedHeight == 0 && len(m.snap.recentHeights) > 0 {
+	if (m.selectedHeight == 0 || m.followLatest) && len(m.snap.recentHeights) > 0 {
 		m.selectedHeight = m.snap.recentHeights[0].Height
 	}
 	if m.selectedHeight != 0 {
@@ -404,14 +422,54 @@ func (m *Model) reloadSnapshot() {
 		}
 	}
 
-	items := m.visibleIncidents()
-	if len(items) == 0 {
-		m.incidentSelection = 0
-	} else if m.incidentSelection >= len(items) {
-		m.incidentSelection = len(items) - 1
-	}
+	m.reconcileIncidentSelection()
 
 	if !m.showHelp {
+		m.refreshViewport()
+	}
+}
+
+func (m *Model) applyStoreEvent(event storepkg.StoreEvent) {
+	refreshViewport := false
+
+	switch event.Kind {
+	case "height_updated":
+		m.snap.tip = m.store.CurrentTip()
+		m.snap.recentHeights = m.store.RecentHeights(32)
+
+		if len(m.snap.recentHeights) > 0 {
+			switch {
+			case m.selectedHeight == 0 || m.followLatest:
+				next := m.snap.recentHeights[0].Height
+				if next != m.selectedHeight {
+					m.selectedHeight = next
+					refreshViewport = true
+				}
+			case event.Height == m.selectedHeight:
+				refreshViewport = true
+			default:
+				if _, ok := m.store.GetHeight(m.selectedHeight); !ok {
+					m.selectedHeight = m.snap.recentHeights[0].Height
+					refreshViewport = true
+				}
+			}
+		}
+	case "node_updated":
+		m.snap.nodes = m.store.NodeStates()
+		if m.mode == viewDetail && m.detailTab == tabPropagation {
+			refreshViewport = true
+		}
+	case "incident_updated":
+		m.snap.activeIncidents = m.store.ActiveIncidents()
+		m.snap.resolvedIncidents = m.store.RecentResolved(8)
+	}
+
+	m.reconcileIncidentSelection()
+
+	if m.showHelp {
+		return
+	}
+	if m.mode == viewDetail && refreshViewport {
 		m.refreshViewport()
 	}
 }
@@ -502,6 +560,7 @@ func (m *Model) navigateHeight(delta int) {
 	if len(m.snap.recentHeights) == 0 {
 		return
 	}
+	m.followLatest = false
 
 	index := 0
 	for i, entry := range m.snap.recentHeights {
@@ -519,6 +578,24 @@ func (m *Model) navigateHeight(delta int) {
 	m.refreshViewport()
 }
 
+func (m *Model) jumpToLatestHeight() {
+	if len(m.snap.recentHeights) == 0 {
+		return
+	}
+	m.selectedHeight = m.snap.recentHeights[0].Height
+	m.followLatest = true
+	m.refreshViewport()
+}
+
+func (m *Model) jumpToOldestHeight() {
+	if len(m.snap.recentHeights) == 0 {
+		return
+	}
+	m.selectedHeight = m.snap.recentHeights[len(m.snap.recentHeights)-1].Height
+	m.followLatest = false
+	m.refreshViewport()
+}
+
 func (m *Model) cycleSeverityFilter() {
 	switch m.severityFilter {
 	case "":
@@ -533,6 +610,15 @@ func (m *Model) cycleSeverityFilter() {
 		m.severityFilter = model.SeverityInfo
 	default:
 		m.severityFilter = ""
+	}
+}
+
+func (m *Model) reconcileIncidentSelection() {
+	items := m.visibleIncidents()
+	if len(items) == 0 {
+		m.incidentSelection = 0
+	} else if m.incidentSelection >= len(items) {
+		m.incidentSelection = len(items) - 1
 	}
 }
 

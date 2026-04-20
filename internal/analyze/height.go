@@ -758,6 +758,33 @@ func buildValidatorVoteGrid(events []model.Event, genesis model.Genesis, meta mo
 	}
 
 	// Process prevote/precommit events.
+	type voteKey struct {
+		round    int
+		voteType string
+		index    int
+	}
+	successfulVotes := map[voteKey]bool{}
+	failedVotes := map[voteKey]bool{}
+	for _, ev := range events {
+		switch ev.Kind {
+		case model.EventSignedVote, model.EventSignVoteError:
+			vidx, ok := ev.Fields["_vidx"].(int)
+			if !ok || vidx < 0 || vidx >= len(rows) {
+				continue
+			}
+			voteType, _ := ev.Fields["_vote_type"].(string)
+			if voteType == "" {
+				continue
+			}
+			key := voteKey{round: ev.Round, voteType: voteType, index: vidx}
+			if ev.Kind == model.EventSignedVote {
+				successfulVotes[key] = true
+			} else {
+				failedVotes[key] = true
+			}
+		}
+	}
+
 	for _, ev := range events {
 		if ev.Kind != model.EventAddedPrevote && ev.Kind != model.EventAddedPrecommit {
 			continue
@@ -900,6 +927,23 @@ func buildValidatorVoteGrid(events []model.Event, genesis model.Genesis, meta mo
 	}
 	applyBASample(prevoteBA, false)
 	applyBASample(precommitBA, true)
+
+	// Explicit signer failures override BA-only inference unless we later saw a
+	// successful signed vote for the same validator/round/type. This avoids
+	// painting dropped votes as "block" just because peers eventually formed a
+	// partial VoteSet BitArray without that validator.
+	for key := range failedVotes {
+		if successfulVotes[key] {
+			continue
+		}
+		entry := rows[key.index].ByRound[key.round]
+		if key.voteType == "precommit" {
+			entry.Precommit = model.VoteAbsent
+		} else if key.voteType == "prevote" {
+			entry.Prevote = model.VoteAbsent
+		}
+		rows[key.index].ByRound[key.round] = entry
+	}
 
 	return rows
 }

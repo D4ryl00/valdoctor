@@ -34,6 +34,23 @@ func TestParseConsoleLineWithANSIAndContainerPrefix(t *testing.T) {
 	require.Equal(t, "Added peer", event.Message)
 }
 
+func TestParseConsoleReceiveVoteUsesEmbeddedWireMessage(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "val3", Role: model.RoleValidator}
+	line := "val3-1  | 2026-04-20T21:43:23.301Z\t\x1b[35mDEBUG\x1b[0m\tReceive\t{\"module\":\"consensus\",\"src\":\"Peer{MConn{172.20.0.7:52858} g1u9f8lwsqmjclrmmmluy4kalemkwgx2yvpjqgfc in}\",\"chId\":34,\"msg\":\"[Vote Vote{1:2E6BC11AECD0 160/00/1(Prevote) 3A2534EFFDE9 E554F77A28A6 @ 2026-04-20T21:43:23.198036843Z}]\"}"
+
+	event, warning := ParseLogLine(source, line, 42)
+
+	require.Empty(t, warning)
+	require.Equal(t, "console", event.Format)
+	require.Equal(t, model.EventAddedPrevote, event.Kind)
+	require.EqualValues(t, 160, event.Height)
+	require.Equal(t, 0, event.Round)
+	require.Equal(t, "prevote", event.Fields["_vote_type"])
+	require.Equal(t, 1, event.Fields["_vidx"])
+	require.Equal(t, "2E6BC11AECD0", event.Fields["_vaddrprefix"])
+	require.Equal(t, "3A2534EFFDE9", event.Fields["_vhash"])
+}
+
 func TestParseVoteSetIncludesBitmap(t *testing.T) {
 	recv, total, maj23, maj23Hash, bits := parseVoteSet("VoteSet{H:19497 R:0 T:2 +2/3:<nil>(0.571) BA{7:x__xx__} map[]}")
 
@@ -55,6 +72,20 @@ func TestParseJSONLineClassifiesVoteSigningError(t *testing.T) {
 	require.Equal(t, model.EventSignVoteError, event.Kind)
 	require.EqualValues(t, 234888, event.Height)
 	require.Equal(t, 0, event.Round)
+}
+
+func TestParseJSONLineExtractsSignVoteErrorDetails(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator}
+	line := `{"level":"error","ts":1775590325.1933045,"msg":"Error signing vote","height":160,"round":0,"vote":"Vote{1:2E6BC11AECD0 160/00/2(Precommit) 3A2534EFFDE9 000000000000 @ 2026-04-20T21:43:23.21024801Z}","err":"response contains error: valsigner: signature dropped by control rule"}`
+
+	event, warning := ParseLogLine(source, line, 88)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventSignVoteError, event.Kind)
+	require.Equal(t, "precommit", event.Fields["_vote_type"])
+	require.Equal(t, 1, event.Fields["_vidx"])
+	require.Equal(t, "2E6BC11AECD0", event.Fields["_vaddrprefix"])
+	require.Equal(t, "3A2534EFFDE9", event.Fields["_vhash"])
 }
 
 func TestParseJSONLineClassifiesConsensusWALIssue(t *testing.T) {
@@ -101,6 +132,7 @@ func TestParseJSONLineClassifiesSignedVote(t *testing.T) {
 	require.Equal(t, 0, event.Round)
 	require.Equal(t, "prevote", event.Fields["_vote_type"])
 	require.Equal(t, "QVE0YT0VT4TS", event.Fields["_vaddrprefix"])
+	require.Equal(t, 1, event.Fields["_vidx"])
 	require.Equal(t, "", event.Fields["_vhash"])
 	_, ok := event.Fields["_cast_at"].(time.Time)
 	require.True(t, ok)
@@ -114,4 +146,22 @@ func TestParseJSONLineClassifiesPeerConfigError(t *testing.T) {
 
 	require.Empty(t, warning)
 	require.Equal(t, model.EventPeerConfigError, event.Kind)
+}
+
+func TestParseJSONLineClassifiesNodeShutdown(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator}
+	line := `{"level":"info","ts":1775590325.1591926,"msg":"Stopping Node"}`
+
+	event, warning := ParseLogLine(source, line, 200)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventNodeShutdown, event.Kind)
+}
+
+func TestDefaultNodeNameExtractsComposeValidatorService(t *testing.T) {
+	used := map[string]int{}
+
+	require.Equal(t, "val1", DefaultNodeName("valcontrol-5-validators-val1-1", used))
+	require.Equal(t, "val1_signer", DefaultNodeName("valcontrol-5-validators-val1-signer-1", used))
+	require.Equal(t, "validator3", DefaultNodeName("project-validator3-1", used))
 }

@@ -77,16 +77,33 @@ func newInspectCmd(io commands.IO) *commands.Command {
 		},
 		cfg,
 		func(ctx context.Context, args []string) error {
-			// Positional arguments are treated as additional --log paths so
-			// shell globs work: `val*.log` expands into separate argv entries.
-			for _, arg := range args {
-				if err := cfg.logPaths.Set(arg); err != nil {
-					return fmt.Errorf("invalid log path %q: %w", arg, err)
-				}
+			// Positional arguments inherit the only explicitly selected role
+			// bucket when possible so shell brace expansion works naturally:
+			// `--validator-log logs/val{1,2,3}.log` expands to one flagged path
+			// plus positional siblings that should also remain validator logs.
+			if err := appendPositionalFileArgs(&cfg.logPaths, &cfg.validatorLogs, &cfg.sentryLogs, args); err != nil {
+				return err
 			}
 			return execInspect(ctx, cfg, io)
 		},
 	)
+}
+
+func appendPositionalFileArgs(logPaths, validatorLogs, sentryLogs *multiString, args []string) error {
+	target := logPaths
+	switch {
+	case len(*logPaths) == 0 && len(*validatorLogs) > 0 && len(*sentryLogs) == 0:
+		target = validatorLogs
+	case len(*logPaths) == 0 && len(*sentryLogs) > 0 && len(*validatorLogs) == 0:
+		target = sentryLogs
+	}
+
+	for _, arg := range args {
+		if err := target.Set(arg); err != nil {
+			return fmt.Errorf("invalid log path %q: %w", arg, err)
+		}
+	}
+	return nil
 }
 
 func (c *inspectCfg) RegisterFlags(fs *flag.FlagSet) {

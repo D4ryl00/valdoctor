@@ -28,6 +28,24 @@ func TestBuildLiveSourcesIncludesDockerSources(t *testing.T) {
 	require.Equal(t, model.RoleValidator, sources[1].Role)
 }
 
+func TestBuildLiveSourcesNormalizesValcontrolDockerNames(t *testing.T) {
+	cfg := &liveCfg{
+		dockerSources: multiString{
+			"valcontrol-5-validators-val1-1",
+			"valcontrol-5-validators-val2-1",
+		},
+	}
+
+	sources, err := buildLiveSources(cfg, model.Metadata{})
+	require.NoError(t, err)
+	require.Len(t, sources, 2)
+
+	require.Equal(t, "val1", sources[0].Node)
+	require.Equal(t, model.RoleValidator, sources[0].Role)
+	require.Equal(t, "val2", sources[1].Node)
+	require.Equal(t, model.RoleValidator, sources[1].Role)
+}
+
 func TestParseDockerBindingRequiresPrefix(t *testing.T) {
 	value, ok := parseDockerBinding("docker:validator-a")
 	require.True(t, ok)
@@ -131,4 +149,30 @@ func TestOpenLiveStoreUsesSQLiteWhenDBConfigured(t *testing.T) {
 
 	_, ok := liveStore.(*store.SQLiteStore)
 	require.True(t, ok)
+}
+
+func TestAppendPositionalFileArgsInheritsValidatorRole(t *testing.T) {
+	logs := multiString{}
+	validators := multiString{"/tmp/val1.log"}
+	sentries := multiString{}
+
+	err := appendPositionalFileArgs(&logs, &validators, &sentries, []string{"/tmp/val2.log", "/tmp/val3.log"})
+	require.NoError(t, err)
+
+	require.Empty(t, logs)
+	require.Equal(t, multiString{"/tmp/val1.log", "/tmp/val2.log", "/tmp/val3.log"}, validators)
+	require.Empty(t, sentries)
+}
+
+func TestAppendPositionalFileArgsStaysGenericWhenMixedRolesExist(t *testing.T) {
+	logs := multiString{}
+	validators := multiString{"/tmp/val1.log"}
+	sentries := multiString{"/tmp/sentry1.log"}
+
+	err := appendPositionalFileArgs(&logs, &validators, &sentries, []string{"/tmp/extra.log"})
+	require.NoError(t, err)
+
+	require.Equal(t, multiString{"/tmp/extra.log"}, logs)
+	require.Equal(t, multiString{"/tmp/val1.log"}, validators)
+	require.Equal(t, multiString{"/tmp/sentry1.log"}, sentries)
 }

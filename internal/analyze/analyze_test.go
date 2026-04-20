@@ -157,6 +157,50 @@ func TestBuildReportConsensusWALIssue(t *testing.T) {
 	require.True(t, found, "expected consensus-wal-issue finding")
 }
 
+func TestBuildReportSuppressesInitialConsensusWALBootstrapNoise(t *testing.T) {
+	now := time.Date(2026, 4, 20, 16, 19, 36, 0, time.UTC)
+	report := BuildReport(Input{
+		Genesis: model.Genesis{
+			Path:         "/tmp/genesis.json",
+			ChainID:      "test17",
+			ValidatorNum: 1,
+		},
+		Sources: []model.Source{
+			{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator},
+		},
+		Events: []model.Event{
+			{
+				Timestamp:    now,
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         55,
+				Message:      "Error on catchup replay. Proceeding to start ConsensusState anyway",
+				Fields: map[string]any{
+					"err": "cannot replay height 1. WAL does not contain #ENDHEIGHT for 0",
+				},
+				Kind: model.EventConsensusWALIssue,
+			},
+			{
+				Timestamp:    now.Add(time.Second),
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         56,
+				Message:      "Finalizing commit of block",
+				Kind:         model.EventFinalizeCommit,
+				Height:       1,
+			},
+		},
+	})
+
+	for _, f := range report.Findings {
+		require.NotEqual(t, "consensus-wal-issue-validator_1", f.ID)
+	}
+}
+
 func TestBuildReportSignProposalError(t *testing.T) {
 	now := time.Date(2026, 4, 7, 19, 32, 5, 0, time.UTC)
 	report := BuildReport(Input{
@@ -230,4 +274,65 @@ func TestBuildReportPeerConfigError(t *testing.T) {
 		}
 	}
 	require.True(t, found, "expected peer-config-error finding")
+}
+
+func TestBuildReportSuppressesPeerStarvationDuringGracefulShutdown(t *testing.T) {
+	now := time.Date(2026, 4, 20, 16, 20, 28, 0, time.UTC)
+	report := BuildReport(Input{
+		Genesis: model.Genesis{
+			Path:         "/tmp/genesis.json",
+			ChainID:      "test17",
+			ValidatorNum: 1,
+		},
+		Sources: []model.Source{
+			{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator},
+		},
+		Events: []model.Event{
+			{
+				Timestamp:    now.Add(-3 * time.Second),
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         10,
+				Message:      "Added peer",
+				Kind:         model.EventAddedPeer,
+			},
+			{
+				Timestamp:    now.Add(-2 * time.Second),
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         11,
+				Message:      "Timed out",
+				Kind:         model.EventTimeout,
+				Height:       9,
+			},
+			{
+				Timestamp:    now.Add(-1500 * time.Millisecond),
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         12,
+				Message:      "Stopping peer",
+				Kind:         model.EventStoppedPeer,
+			},
+			{
+				Timestamp:    now.Add(-time.Second),
+				HasTimestamp: true,
+				Node:         "validator_1",
+				Role:         model.RoleValidator,
+				Path:         "/tmp/validator.log",
+				Line:         13,
+				Message:      "Stopping Node",
+				Kind:         model.EventNodeShutdown,
+			},
+		},
+	})
+
+	for _, f := range report.Findings {
+		require.NotEqual(t, "peer-starvation-validator_1", f.ID)
+	}
 }

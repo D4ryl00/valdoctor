@@ -40,6 +40,61 @@ func TestFileSourceFollowsNewLinesOnly(t *testing.T) {
 	}
 }
 
+func TestFileSourceBootstrapReadsExistingLinesThenFollows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.log")
+	require.NoError(t, os.WriteFile(path, []byte("2026-04-16T10:00:00Z INFO old\n"), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := &FileSource{
+		Source:       model.Source{Path: path, Node: "validator-a", Role: model.RoleValidator},
+		Bootstrap:    true,
+		PollInterval: 20 * time.Millisecond,
+	}
+	lines, errs := src.Stream(ctx)
+
+	first := waitForLine(t, lines)
+	require.Contains(t, first.Raw, "old")
+
+	appendLine(t, path, "2026-04-16T10:00:01Z INFO new\n")
+
+	second := waitForLine(t, lines)
+	require.Contains(t, second.Raw, "new")
+
+	select {
+	case err := <-errs:
+		require.NoError(t, err)
+	default:
+	}
+}
+
+func TestFileSourceBootstrapDoesNotRequireTimestampSniff(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.log")
+	content := "" +
+		"val1-1  | 2026-04-20T17:41:32.373Z\tINFO\tSwitchToConsensus\t{\"module\":\"consensus\"}\n" +
+		"val1-1  | 2026-04-20T17:41:32.376Z\tINFO\tTimed out\t{\"module\":\"consensus\",\"height\":1,\"round\":0,\"step\":\"RoundStepNewHeight\"}\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := &FileSource{
+		Source:       model.Source{Path: path, Node: "val1", Role: model.RoleValidator},
+		Bootstrap:    true,
+		PollInterval: 20 * time.Millisecond,
+	}
+	lines, _ := src.Stream(ctx)
+
+	first := waitForLine(t, lines)
+	require.Contains(t, first.Raw, "SwitchToConsensus")
+
+	second := waitForLine(t, lines)
+	require.Contains(t, second.Raw, `"height":1`)
+}
+
 func TestFileSourceSinceBootstrapsThenFollows(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "node.log")

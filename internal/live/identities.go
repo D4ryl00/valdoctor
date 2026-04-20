@@ -27,10 +27,11 @@ func (r *IdentityResolver) ResolveByNode(name string) (model.ValidatorIdentity, 
 
 	if metaNode, ok := r.Metadata.Nodes[name]; ok {
 		identity := model.ValidatorIdentity{
-			NodeName:    name,
-			FullAddr:    metaNode.ValidatorAddress,
-			ShortAddr:   shortAddr(metaNode.ValidatorAddress),
-			IsValidator: metaNode.ValidatorAddress != "" || metaNode.ValidatorName != "" || strings.EqualFold(metaNode.Role, string(model.RoleValidator)),
+			NodeName:     name,
+			FullAddr:     metaNode.ValidatorAddress,
+			ShortAddr:    shortAddr(metaNode.ValidatorAddress),
+			GenesisIndex: -1,
+			IsValidator:  metaNode.ValidatorAddress != "" || metaNode.ValidatorName != "" || strings.EqualFold(metaNode.Role, string(model.RoleValidator)),
 		}
 		if idx, ok := r.findGenesis(metaNode.ValidatorAddress, metaNode.ValidatorName); ok {
 			identity.GenesisIndex = idx
@@ -58,8 +59,9 @@ func (r *IdentityResolver) ResolveByNode(name string) (model.ValidatorIdentity, 
 
 	if source, ok := r.findSource(name, false); ok {
 		return model.ValidatorIdentity{
-			NodeName:    source.Node,
-			IsValidator: source.Role == model.RoleValidator,
+			NodeName:     source.Node,
+			GenesisIndex: -1,
+			IsValidator:  source.Role == model.RoleValidator,
 		}, true
 	}
 
@@ -80,11 +82,13 @@ func (r *IdentityResolver) ResolveByShortAddr(prefix string) (model.ValidatorIde
 	for _, validator := range r.Genesis.Validators {
 		short := shortAddr(validator.Address)
 		if strings.HasPrefix(short, want) {
+			idx, _ := r.findGenesis(validator.Address, validator.Name)
 			return model.ValidatorIdentity{
-				NodeName:    validator.Name,
-				FullAddr:    validator.Address,
-				ShortAddr:   short,
-				IsValidator: true,
+				NodeName:     validator.Name,
+				FullAddr:     validator.Address,
+				ShortAddr:    short,
+				GenesisIndex: idx,
+				IsValidator:  true,
 			}, true
 		}
 	}

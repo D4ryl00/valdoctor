@@ -449,6 +449,139 @@ func TestCoordinatorDoesNotFlagNodeAsStalledWhileBacklogStillStreaming(t *testin
 	}
 }
 
+func TestCoordinatorPeriodicallyFlagsHistoricalHaltAfterBacklogGoesQuiet(t *testing.T) {
+	memStore := store.NewMemoryStore(16)
+	now := time.Now().UTC().Add(-20 * time.Second)
+
+	appendCommit := func(node string, ts time.Time, height int64, line int) {
+		require.NoError(t, memStore.AppendEvent(model.Event{
+			Timestamp:    ts,
+			HasTimestamp: true,
+			Node:         node,
+			Role:         model.RoleValidator,
+			Path:         "/tmp/" + node + ".log",
+			Line:         line,
+			Message:      "Finalizing commit of block",
+			Kind:         model.EventFinalizeCommit,
+			Height:       height,
+		}))
+	}
+
+	appendCommit("val1", now, 70, 1)
+	appendCommit("val2", now.Add(time.Second), 71, 1)
+	appendCommit("val3", now.Add(2*time.Second), 71, 1)
+	appendCommit("val4", now.Add(3*time.Second), 71, 1)
+	appendCommit("val5", now.Add(4*time.Second), 71, 1)
+	memStore.SetTip(71)
+
+	updates := make(chan model.IncidentCard, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	coord := &Coordinator{
+		Source: &idleStubSource{},
+		Store:  memStore,
+		Genesis: model.Genesis{
+			ChainID: "test-chain",
+		},
+		Sources: []model.Source{
+			{Path: "/tmp/val1.log", Node: "val1", Role: model.RoleValidator},
+			{Path: "/tmp/val2.log", Node: "val2", Role: model.RoleValidator},
+			{Path: "/tmp/val3.log", Node: "val3", Role: model.RoleValidator},
+			{Path: "/tmp/val4.log", Node: "val4", Role: model.RoleValidator},
+			{Path: "/tmp/val5.log", Node: "val5", Role: model.RoleValidator},
+		},
+		Debounce:        5 * time.Millisecond,
+		RefreshInterval: 10 * time.Millisecond,
+		ClosureEvaluator: ClosureEvaluator{
+			Policy:           model.PolicyObservedValidatorMajority,
+			ValidatorSources: []string{"val1", "val2", "val3", "val4", "val5"},
+		},
+		MaxHistory: 16,
+		OnIncidentUpdate: func(card model.IncidentCard) {
+			updates <- card
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- coord.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		for _, card := range memStore.ActiveIncidents() {
+			if card.ID == "stalled-validator-val1" {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	err := <-done
+	require.True(t, err == nil || err == context.Canceled)
+
+	select {
+	case update := <-updates:
+		require.Equal(t, "stalled-validator", update.Kind)
+		require.Equal(t, "active", update.Status)
+		require.Equal(t, "stalled-validator-val1", update.ID)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stalled-validator incident")
+	}
+}
+
+func TestCoordinatorBuildsRuntimeValidatorOrderFromBufferedSignedVotes(t *testing.T) {
+	memStore := store.NewMemoryStore(16)
+	appendSignedVote := func(node, addr string, idx int, height int64, line int) {
+		require.NoError(t, memStore.AppendEvent(model.Event{
+			Timestamp:    time.Now().UTC(),
+			HasTimestamp: true,
+			Node:         node,
+			Role:         model.RoleValidator,
+			Path:         "/tmp/" + node + ".log",
+			Line:         line,
+			Kind:         model.EventSignedVote,
+			Height:       height,
+			Fields: map[string]any{
+				"_vidx":             idx,
+				"_vaddrprefix":      "IGNORED",
+				"validator address": addr,
+			},
+		}))
+	}
+
+	appendSignedVote("val3", "g1zhmn5c3g4dhkdh52fn772wz3vl8naqlc8fzvwy", 0, 70, 1)
+	appendSignedVote("val4", "g17whselle8ke692awdtcyvcneakgxw7qjryrszc", 1, 70, 1)
+	appendSignedVote("val1", "g1jwczk2k625wtzlv4fudscxhya2lq5k6ksqfzyk", 2, 70, 1)
+	appendSignedVote("val2", "g15k7zj4t8pxgedxs822lmj6eun2m9e6hmd6slf5", 3, 70, 1)
+	appendSignedVote("val5", "g1g9lm70uteks5l0psrqrs0hfq63f0yraejfgj6r", 4, 70, 1)
+	memStore.SetTip(70)
+
+	coord := &Coordinator{
+		Store: memStore,
+		Genesis: model.Genesis{
+			ChainID: "test-chain",
+		},
+		Sources: []model.Source{
+			{Path: "/tmp/val1.log", Node: "val1", Role: model.RoleValidator},
+			{Path: "/tmp/val2.log", Node: "val2", Role: model.RoleValidator},
+			{Path: "/tmp/val3.log", Node: "val3", Role: model.RoleValidator},
+			{Path: "/tmp/val4.log", Node: "val4", Role: model.RoleValidator},
+			{Path: "/tmp/val5.log", Node: "val5", Role: model.RoleValidator},
+		},
+		resolver: &IdentityResolver{},
+	}
+
+	validators := coord.runtimeValidatorsFromBufferedEvents()
+	require.Len(t, validators, 5)
+	require.Equal(t, "g1zhmn5c3g4dhkdh52fn772wz3vl8naqlc8fzvwy", validators[0].Address)
+	require.Equal(t, "g17whselle8ke692awdtcyvcneakgxw7qjryrszc", validators[1].Address)
+	require.Equal(t, "g1jwczk2k625wtzlv4fudscxhya2lq5k6ksqfzyk", validators[2].Address)
+	require.Equal(t, "g15k7zj4t8pxgedxs822lmj6eun2m9e6hmd6slf5", validators[3].Address)
+	require.Equal(t, "g1g9lm70uteks5l0psrqrs0hfq63f0yraejfgj6r", validators[4].Address)
+}
+
 type stubSource struct {
 	lines []source.Line
 }
@@ -507,6 +640,25 @@ func (s *delayedStubSource) Stream(ctx context.Context) (<-chan source.Line, <-c
 			case lines <- item.line:
 			}
 		}
+	}()
+
+	return lines, errs
+}
+
+type idleStubSource struct{}
+
+func (s *idleStubSource) Name() string {
+	return "idle-stub"
+}
+
+func (s *idleStubSource) Stream(ctx context.Context) (<-chan source.Line, <-chan error) {
+	lines := make(chan source.Line)
+	errs := make(chan error)
+
+	go func() {
+		defer close(lines)
+		defer close(errs)
+		<-ctx.Done()
 	}()
 
 	return lines, errs

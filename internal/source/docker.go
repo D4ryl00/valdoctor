@@ -15,6 +15,8 @@ import (
 
 type dockerLogsRunner func(ctx context.Context, args []string) (io.ReadCloser, <-chan error, error)
 
+const defaultDockerBootstrapTail = "50000"
+
 type DockerSource struct {
 	Source     model.Source
 	Container  string
@@ -126,7 +128,11 @@ func (d *DockerSource) commandArgsWithSince(since time.Time) []string {
 	case !d.Since.IsZero():
 		args = append(args, "--since", d.Since.UTC().Format(time.RFC3339))
 	default:
-		args = append(args, "--tail", "0")
+		// Bootstrap a bounded recent backlog so live mode can reconstruct the
+		// current chain state even when attaching after a fault has already
+		// happened. Without this, halted chains look like "tip 1" forever
+		// because docker logs would only stream future lines.
+		args = append(args, "--tail", defaultDockerBootstrapTail)
 	}
 	args = append(args, d.Container)
 	return args

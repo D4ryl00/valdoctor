@@ -22,7 +22,7 @@ func renderDetail(m Model) string {
 	}
 
 	title := m.styles.title.Render(fmt.Sprintf("Height h%d", entry.Height))
-	meta := m.styles.muted.Render(fmt.Sprintf("status %s  ·  recent heights %s", heightStatusText(entry.Status), recentHeightList(m)))
+	meta := m.styles.muted.Render(fmt.Sprintf("%s  ·  status %s  ·  recent heights %s", detailSelectionMode(m), heightStatusText(entry.Status), recentHeightList(m)))
 	body := m.viewport.View()
 	help := m.styles.help.Render(keyHelp(m.mode, m.searching, m.showHelp, m.confirmQuit))
 
@@ -33,6 +33,13 @@ func renderDetail(m Model) string {
 		body,
 		help,
 	}, "\n\n"))
+}
+
+func detailSelectionMode(m Model) string {
+	if m.followLatest {
+		return "following latest"
+	}
+	return "pinned"
 }
 
 func renderConsensusContent(entry model.HeightEntry, color bool) string {

@@ -59,14 +59,8 @@ func newLiveCmd(io commands.IO) *commands.Command {
 		},
 		cfg,
 		func(ctx context.Context, args []string) error {
-			// Positional arguments are treated as additional --log paths.
-			// This lets shell globs work naturally: the shell expands
-			// `val*.log` into separate argv entries before flag.Parse runs,
-			// and those entries land here rather than in logPaths.
-			for _, arg := range args {
-				if err := cfg.logPaths.Set(arg); err != nil {
-					return fmt.Errorf("invalid log path %q: %w", arg, err)
-				}
+			if err := appendPositionalFileArgs(&cfg.logPaths, &cfg.validatorLogs, &cfg.sentryLogs, args); err != nil {
+				return err
 			}
 			return execLive(ctx, cfg, io)
 		},
@@ -207,6 +201,9 @@ func execLive(ctx context.Context, cfg *liveCfg, io commands.IO) error {
 			logSources = append(logSources, &source.FileSource{
 				Source: src,
 				Since:  since,
+				// Live mode should reconstruct the recent chain state when attaching
+				// to an existing log file, not just tail future lines.
+				Bootstrap: true,
 			})
 		}
 	}
@@ -459,6 +456,9 @@ func buildDockerSources(generic, validators, sentries, nodeBindings, roleBinding
 				}
 			}
 			if role == model.RoleUnknown {
+				role = inferCanonicalValidatorRole(nodeName)
+			}
+			if role == model.RoleUnknown {
 				if metaNode, ok := meta.Nodes[nodeName]; ok {
 					role = model.ParseRole(metaNode.Role)
 				}
@@ -478,6 +478,9 @@ func buildDockerSources(generic, validators, sentries, nodeBindings, roleBinding
 			if mapped, ok := roleByNode[src.Node]; ok {
 				src.Role = mapped
 			}
+		}
+		if src.Role == model.RoleUnknown {
+			src.Role = inferCanonicalValidatorRole(src.Node)
 		}
 		seen[path] = src
 	}
@@ -556,6 +559,9 @@ func buildCmdSources(generic, validators, sentries, roleBindings []string, meta 
 				}
 			}
 			if role == model.RoleUnknown {
+				role = inferCanonicalValidatorRole(name)
+			}
+			if role == model.RoleUnknown {
 				if metaNode, ok := meta.Nodes[name]; ok {
 					role = model.ParseRole(metaNode.Role)
 				}
@@ -605,4 +611,36 @@ func dockerContainerFromSourcePath(path string) string {
 
 func isDockerSourcePath(path string) bool {
 	return strings.HasPrefix(path, "docker:")
+}
+
+func inferCanonicalValidatorRole(name string) model.Role {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return model.RoleUnknown
+	}
+	if strings.HasPrefix(name, "val") && !strings.Contains(name, "_") {
+		allDigits := true
+		for _, r := range name[len("val"):] {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits && len(name) > len("val") {
+			return model.RoleValidator
+		}
+	}
+	if strings.HasPrefix(name, "validator") && !strings.Contains(name, "_") {
+		allDigits := true
+		for _, r := range name[len("validator"):] {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits && len(name) > len("validator") {
+			return model.RoleValidator
+		}
+	}
+	return model.RoleUnknown
 }

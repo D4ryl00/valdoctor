@@ -9,6 +9,7 @@ import (
 	"github.com/D4ryl00/valdoctor/internal/analyze"
 	"github.com/D4ryl00/valdoctor/internal/model"
 	"github.com/D4ryl00/valdoctor/internal/parse"
+	"github.com/D4ryl00/valdoctor/internal/rpc"
 	"github.com/D4ryl00/valdoctor/internal/source"
 	storepkg "github.com/D4ryl00/valdoctor/internal/store"
 )
@@ -22,6 +23,7 @@ type Coordinator struct {
 	ClosureEvaluator ClosureEvaluator
 	MaxHistory       int
 	Debounce         time.Duration
+	RefreshInterval  time.Duration
 	OnTipAdvanced    func(int64)
 	OnHeightClosed   func(int64)
 	OnIncidentUpdate func(model.IncidentCard)
@@ -43,6 +45,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 	if c.Debounce <= 0 {
 		c.Debounce = 50 * time.Millisecond
+	}
+	if c.RefreshInterval <= 0 {
+		c.RefreshInterval = time.Second
 	}
 	if c.rebuildGen == nil {
 		c.rebuildGen = map[int64]int{}
@@ -68,11 +73,16 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	lines, errs := c.Source.Stream(ctx)
+	ticker := time.NewTicker(c.RefreshInterval)
+	defer ticker.Stop()
 
 	for lines != nil || errs != nil {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
+			c.refreshNodeStates()
+			c.refreshIncidents()
 		case line, ok := <-lines:
 			if !ok {
 				lines = nil
@@ -230,11 +240,12 @@ func (c *Coordinator) rebuildHeight(height int64) {
 	sortEvents(events)
 
 	report := analyze.BuildHeightReport(analyze.HeightInput{
-		Height:   height,
-		Genesis:  c.Genesis,
-		Sources:  c.Sources,
-		Metadata: c.Metadata,
-		Events:   events,
+		Height:            height,
+		Genesis:           c.Genesis,
+		Sources:           c.Sources,
+		Metadata:          c.Metadata,
+		Events:            events,
+		RuntimeValidators: c.runtimeValidatorsFromBufferedEvents(),
 	})
 
 	status := model.HeightActive
@@ -323,7 +334,12 @@ func (c *Coordinator) refreshNodeStatesWithMode(forceWallClock bool) {
 	// While historical backlogs are still replaying, suppress this live-mode
 	// extension entirely: per-source replay skew can make healthy validators look
 	// dozens of heights behind even though the issue is just ingestion ordering.
-	replayingHistory := !forceWallClock && !observedHorizon.IsZero() && now.Sub(observedHorizon) > catchUpThreshold
+	latestLineSeen := c.latestLineSeenAt()
+	replayingHistory := !forceWallClock &&
+		!observedHorizon.IsZero() &&
+		now.Sub(observedHorizon) > catchUpThreshold &&
+		!latestLineSeen.IsZero() &&
+		now.Sub(latestLineSeen) <= catchUpThreshold
 	if replayingHistory {
 		states := make([]model.NodeState, 0, len(summaries))
 		for _, summary := range summaries {
@@ -383,6 +399,19 @@ func (c *Coordinator) nodeRecentlySeen(node string, now time.Time, grace time.Du
 		return false
 	}
 	return now.Sub(seenAt) < grace
+}
+
+func (c *Coordinator) latestLineSeenAt() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	latest := time.Time{}
+	for _, seenAt := range c.lineSeenAt {
+		if seenAt.After(latest) {
+			latest = seenAt
+		}
+	}
+	return latest
 }
 
 func (c *Coordinator) snapshotPeerStats() map[string]analyze.NodePeerStats {
@@ -486,6 +515,47 @@ func (c *Coordinator) collectBufferedEvents() []model.Event {
 	}
 	sortEvents(events)
 	return events
+}
+
+func (c *Coordinator) runtimeValidatorsFromBufferedEvents() []rpc.ValidatorEntry {
+	events := c.collectBufferedEvents()
+	if len(events) == 0 {
+		return nil
+	}
+
+	addressByIndex := map[int]string{}
+	maxIdx := -1
+	for _, ev := range events {
+		idx, ok := ev.Fields["_vidx"].(int)
+		if !ok || idx < 0 {
+			continue
+		}
+
+		addr, _ := ev.Fields["validator address"].(string)
+		if addr == "" {
+			if prefix, ok := ev.Fields["_vaddrprefix"].(string); ok && prefix != "" {
+				if identity, found := c.resolver.ResolveByShortAddr(prefix); found {
+					addr = identity.FullAddr
+				}
+			}
+		}
+		if addr == "" {
+			continue
+		}
+		addressByIndex[idx] = addr
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+	}
+	if maxIdx < 0 {
+		return nil
+	}
+
+	validators := make([]rpc.ValidatorEntry, maxIdx+1)
+	for idx, addr := range addressByIndex {
+		validators[idx] = rpc.ValidatorEntry{Address: addr}
+	}
+	return validators
 }
 
 func (c *Coordinator) validatorSourceSet() map[string]struct{} {

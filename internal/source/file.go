@@ -19,6 +19,7 @@ import (
 type FileSource struct {
 	Source       model.Source
 	Since        time.Time
+	Bootstrap    bool
 	PollInterval time.Duration
 	NewWatcher   func() (*fsnotify.Watcher, error)
 }
@@ -77,7 +78,7 @@ func (f *FileSource) followFile(ctx context.Context, out chan<- Line) error {
 		return err
 	}
 
-	startAtBeginning := !f.Since.IsZero()
+	startAtBeginning := f.Bootstrap || !f.Since.IsZero()
 	if !startAtBeginning {
 		lineNo, err := countLines(file)
 		if err != nil {
@@ -92,7 +93,7 @@ func (f *FileSource) followFile(ctx context.Context, out chan<- Line) error {
 	}
 
 	state := fileState{file: file}
-	return f.followOpenFile(ctx, out, &state, true, poll)
+	return f.followOpenFile(ctx, out, &state, !f.Since.IsZero(), poll)
 }
 
 type fileState struct {

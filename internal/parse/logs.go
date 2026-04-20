@@ -38,6 +38,10 @@ var (
 	peerNRSRE = regexp.MustCompile(`\[NewRoundStep H:(\d+) R:(\d+) S:(\w+)`)
 	// peerAddrRE extracts the bech32 peer address from "Peer{MConn{...} g1xxx in/out}".
 	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
+	// composeValServiceRE extracts canonical validator service names from Docker
+	// Compose container names like "valcontrol_5_validators_val1_1" or
+	// "project_validator3_signer_1".
+	composeValServiceRE = regexp.MustCompile(`(?:^|_)((?:val|validator)[0-9]+(?:_signer)?)_[0-9]+$`)
 	// voteDetailRE extracts validator index, address fingerprint, and block hash
 	// from "Added to prevote/precommit" messages (console/VoteSet inline format).
 	// TM2 vote string format: Vote{IDX:ADDRSHORT HEIGHT/ROUND[/TYPE](TypeName) HASH}
@@ -271,7 +275,7 @@ func parseJSONLine(source model.Source, clean string, lineNo int) (model.Event, 
 	if len(payload) > 0 {
 		event.Fields = payload
 	}
-	event.Kind = classifyMessage(event.Message)
+	event.Kind = classifyMessage(classificationMessage(event.Message, event.Fields))
 	enrichEvent(&event)
 	if event.Kind == model.EventUnknown {
 		return event, fmt.Sprintf("%s:%d: unclassified json message %q", source.Path, lineNo, event.Message)
@@ -311,12 +315,25 @@ func parseConsoleLine(source model.Source, clean string, lineNo int) (model.Even
 	if len(fields) > 0 {
 		event.Fields = fields
 	}
-	event.Kind = classifyMessage(event.Message)
+	event.Kind = classifyMessage(classificationMessage(event.Message, event.Fields))
 	enrichEvent(&event)
 	if event.Kind == model.EventUnknown {
 		return event, fmt.Sprintf("%s:%d: unclassified console message %q", source.Path, lineNo, event.Message)
 	}
 	return event, ""
+}
+
+func classificationMessage(message string, fields map[string]any) string {
+	msg := strings.TrimSpace(message)
+	if fields == nil {
+		return msg
+	}
+	inner, _ := fields["msg"].(string)
+	inner = strings.TrimSpace(inner)
+	if strings.HasPrefix(inner, "[") {
+		return inner
+	}
+	return msg
 }
 
 func baseEvent(source model.Source, lineNo int) model.Event {
@@ -419,6 +436,8 @@ func classifyMessage(msg string) model.EventKind {
 		return model.EventConsensusWALIssue
 	case strings.Contains(msg, "WriteSync failed to flush consensus wal"):
 		return model.EventConsensusWALIssue
+	case msg == "Stopping Node":
+		return model.EventNodeShutdown
 
 	// ── Fast-sync (blockchain reactor) ────────────────────────────────────
 	case strings.Contains(msg, "SwitchToConsensus"):
@@ -730,11 +749,13 @@ func classifyMessage(msg string) model.EventKind {
 }
 
 func enrichEvent(event *model.Event) {
+	classifyMsg := classificationMessage(event.Message, event.Fields)
+
 	if event.Height == 0 {
-		event.Height = extractHeight(event.Message, event.Fields)
+		event.Height = extractHeight(classifyMsg, event.Fields)
 	}
 	if event.Round == 0 {
-		event.Round = extractRound(event.Message, event.Fields)
+		event.Round = extractRound(classifyMsg, event.Fields)
 	}
 
 	if event.Kind == model.EventSignedVote {
@@ -749,6 +770,11 @@ func enrichEvent(event *model.Event) {
 		if addr, ok := event.Fields["validator address"].(string); ok && addr != "" {
 			event.Fields["_vaddrprefix"] = voteAddrPrefix(addr)
 		}
+		if idx, ok := event.Fields["validator index"]; ok {
+			if parsed, ok := toInt64(idx); ok && parsed >= 0 {
+				event.Fields["_vidx"] = int(parsed)
+			}
+		}
 		if hash, ok := event.Fields["block_hash"].(string); ok && hash != "" {
 			event.Fields["_vhash"] = strings.ToUpper(hash)
 		} else {
@@ -758,6 +784,31 @@ func enrichEvent(event *model.Event) {
 			if parsed, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", ts); err == nil {
 				event.Fields["_cast_at"] = parsed.UTC()
 			}
+		}
+	}
+
+	if event.Kind == model.EventSignVoteError {
+		if event.Fields == nil {
+			event.Fields = map[string]any{}
+		}
+		voteStr, _ := event.Fields["vote"].(string)
+		if voteStr == "" {
+			voteStr = classifyMsg
+		}
+		if m := voteDetailRE.FindStringSubmatch(voteStr); m != nil {
+			idx, _ := strconv.Atoi(m[1])
+			event.Fields["_vidx"] = idx
+			event.Fields["_vaddrprefix"] = strings.ToUpper(m[2])
+			if m[3] == "<nil>" || strings.Trim(m[3], "0") == "" {
+				event.Fields["_vhash"] = ""
+			} else {
+				event.Fields["_vhash"] = m[3]
+			}
+		}
+		if strings.Contains(voteStr, "(Prevote)") {
+			event.Fields["_vote_type"] = "prevote"
+		} else if strings.Contains(voteStr, "(Precommit)") {
+			event.Fields["_vote_type"] = "precommit"
 		}
 	}
 
@@ -789,7 +840,7 @@ func enrichEvent(event *model.Event) {
 		// Extract per-validator detail: index, address fingerprint, and voted block hash.
 		// "Receive" (consensus) messages: [Vote Vote{IDX:ADDRSHORT H/R/T(Type) HASH SIG @ TS}].
 		// Groups: (1)=idx, (2)=addrShort, (3)=height, (4)=round, (5)=typeName, (6)=hash.
-		if m := voteReceiveRE.FindStringSubmatch(event.Message); m != nil {
+		if m := voteReceiveRE.FindStringSubmatch(classifyMsg); m != nil {
 			idx, _ := strconv.Atoi(m[1])
 			event.Fields["_vidx"] = idx
 			event.Fields["_vaddrprefix"] = strings.ToUpper(m[2])
@@ -805,7 +856,7 @@ func enrichEvent(event *model.Event) {
 			// Groups: (1)=idx, (2)=addrShort, (3)=hash.
 			voteStr, _ := event.Fields["vote"].(string)
 			if voteStr == "" {
-				voteStr = event.Message
+				voteStr = classifyMsg
 			}
 			if m := voteDetailRE.FindStringSubmatch(voteStr); m != nil {
 				idx, _ := strconv.Atoi(m[1])
@@ -1130,6 +1181,9 @@ func DefaultNodeName(path string, used map[string]int) string {
 	base = strings.TrimSuffix(base, filepath.Ext(base))
 	base = strings.ReplaceAll(base, " ", "_")
 	base = strings.ReplaceAll(base, "-", "_")
+	if service := composeServiceName(base); service != "" {
+		base = service
+	}
 	if base == "" {
 		base = "node"
 	}
@@ -1139,4 +1193,12 @@ func DefaultNodeName(path string, used map[string]int) string {
 		return base
 	}
 	return fmt.Sprintf("%s_%d", base, count+1)
+}
+
+func composeServiceName(base string) string {
+	matches := composeValServiceRE.FindStringSubmatch(base)
+	if len(matches) != 2 {
+		return ""
+	}
+	return matches[1]
 }
