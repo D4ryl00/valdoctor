@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -102,4 +103,71 @@ func TestModelEnterOpensDetailAndPauseDefersRefresh(t *testing.T) {
 	m = next.(Model)
 	require.False(t, m.paused)
 	require.EqualValues(t, 11, m.snap.tip)
+}
+
+func TestModelHelpViewScrolls(t *testing.T) {
+	memStore := store.NewMemoryStore(8)
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+	m.width = 80
+	m.height = 14
+	m.resizeViewport()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = next.(Model)
+	require.True(t, m.showHelp)
+	require.Equal(t, 0, m.viewport.YOffset)
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(Model)
+	require.Greater(t, m.viewport.YOffset, 0)
+}
+
+func TestModelCtrlCDoubleQuits(t *testing.T) {
+	memStore := store.NewMemoryStore(8)
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = next.(Model)
+	require.True(t, m.confirmQuit)
+	require.False(t, m.quitYes)
+	require.Nil(t, cmd)
+
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = next.(Model)
+	require.NotNil(t, cmd)
+	require.IsType(t, tea.QuitMsg{}, cmd())
+}
+
+func TestRenderDashboardLimitsIncidentList(t *testing.T) {
+	memStore := store.NewMemoryStore(16)
+	now := time.Now().UTC()
+	memStore.SetTip(12)
+	memStore.SetNodeStates([]model.NodeState{
+		{Summary: model.NodeSummary{Name: "val1", Role: model.RoleValidator, HighestCommit: 12, CurrentPeers: 3, MaxPeers: 3}},
+		{Summary: model.NodeSummary{Name: "val2", Role: model.RoleValidator, HighestCommit: 12, CurrentPeers: 3, MaxPeers: 3}},
+	})
+	for i := 0; i < 8; i++ {
+		memStore.UpsertIncident(model.IncidentCard{
+			ID:          "incident-" + string(rune('a'+i)),
+			Kind:        "vote-propagation-miss",
+			Severity:    model.SeverityMedium,
+			Status:      "active",
+			Scope:       "val2",
+			Title:       "Missing prevote receipts",
+			Summary:     "summary",
+			FirstHeight: int64(10 + i),
+			LastHeight:  int64(10 + i),
+			UpdatedAt:   now.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	m := newModel(Options{Store: memStore, ChainID: "test-chain"})
+	m.width = 100
+	m.height = 14
+
+	out := renderDashboard(m)
+
+	require.Contains(t, out, "Nodes")
+	require.Contains(t, out, "… ")
+	require.LessOrEqual(t, strings.Count(out, "Missing prevote receipts"), 2)
 }

@@ -546,7 +546,7 @@ func buildRoundSummaries(events []model.Event, height int64) ([]model.RoundSumma
 			TimedOut:             rd.timedOutPropose || rd.timedOutPrevote,
 		}
 		rs.PrevoteNarrative = buildPrevoteNarrative(
-			rd.proposalSeen, rd.prevoteNilSeen, rd.timedOutPropose,
+			rd.proposalSeen, rd.prevoteNilSeen, rd.timedOutPropose, rd.committed,
 			rd.pvMaj23, rd.pvHash, rd.pvRecv, rd.pvTotal,
 		)
 		rs.PrecommitNarrative = buildPrecommitNarrative(
@@ -560,7 +560,7 @@ func buildRoundSummaries(events []model.Event, height int64) ([]model.RoundSumma
 }
 
 // buildPrevoteNarrative produces a human-readable summary of the prevote step outcome.
-func buildPrevoteNarrative(proposalSeen, prevoteNilSeen, timedOutPropose,
+func buildPrevoteNarrative(proposalSeen, prevoteNilSeen, timedOutPropose, committed,
 	pvMaj23 bool, pvHash string, pvRecv, pvTotal int,
 ) string {
 	if pvMaj23 {
@@ -581,6 +581,9 @@ func buildPrevoteNarrative(proposalSeen, prevoteNilSeen, timedOutPropose,
 	if pvTotal > 0 {
 		return fmt.Sprintf("%d/%d (no +2/3)", pvRecv, pvTotal)
 	}
+	if committed {
+		return "+2/3 (no vote data)"
+	}
 	return "unknown"
 }
 
@@ -591,11 +594,11 @@ func buildPrecommitNarrative(noMaj23, finalizeNo23, committed,
 	pcMaj23 bool, pcMaj23Hash string, pvMaj23, prevoteTimedOut bool,
 	recv, total int, dataAvailable bool,
 ) string {
-	if !dataAvailable {
-		return "not reached"
-	}
 	if committed {
 		return "+2/3 block"
+	}
+	if !dataAvailable {
+		return "not reached"
 	}
 	if pcMaj23 {
 		if pcMaj23Hash != "" {
@@ -706,6 +709,16 @@ func buildValidatorVoteGrid(events []model.Event, genesis model.Genesis, meta mo
 				rows[i].Addr = info.addr
 			}
 		}
+
+		// Genesis fallback: slots still without a name are labeled directly from
+		// genesis validator order. This handles log formats that carry no per-vote
+		// address detail (e.g. gnoland debug), where slot i == genesis slot i.
+		for i := range rows {
+			if rows[i].Name == "" && i < len(genesis.Validators) {
+				rows[i].Name = genesis.Validators[i].Name
+				rows[i].Addr = genesis.Validators[i].Address
+			}
+		}
 	}
 
 	// Determine the proposal block hash per round (used to classify "other block").
@@ -811,6 +824,82 @@ func buildValidatorVoteGrid(events []model.Event, genesis model.Genesis, meta mo
 			rows[i].ByRound[r] = entry
 		}
 	}
+
+	// BitArray fallback: some log formats (e.g. gnoland debug) log only the
+	// VoteSet BitArray and not per-vote detail, so _vidx is never set and all
+	// slots default to "absent" above.  Use the most informative BA snapshot
+	// (most 'x' bits) per round to upgrade absent slots to the correct kind.
+	type baSample struct {
+		bits      string
+		maj23     bool
+		maj23Hash string
+		xCount    int
+	}
+	prevoteBA := map[int]baSample{}
+	precommitBA := map[int]baSample{}
+	for _, ev := range events {
+		if ev.Kind != model.EventAddedPrevote && ev.Kind != model.EventAddedPrecommit {
+			continue
+		}
+		bits, _ := ev.Fields["_vbits"].(string)
+		if bits == "" {
+			continue
+		}
+		xCount := 0
+		for _, c := range bits {
+			if c == 'x' {
+				xCount++
+			}
+		}
+		maj23, _ := ev.Fields["_vmaj23"].(bool)
+		maj23Hash, _ := ev.Fields["_vmaj23hash"].(string)
+		target := prevoteBA
+		if ev.Kind == model.EventAddedPrecommit {
+			target = precommitBA
+		}
+		if existing, ok := target[ev.Round]; !ok || xCount > existing.xCount {
+			target[ev.Round] = baSample{bits, maj23, maj23Hash, xCount}
+		}
+	}
+	applyBASample := func(byRound map[int]baSample, isPrecommit bool) {
+		for round, sample := range byRound {
+			if len(sample.bits) != len(rows) {
+				continue // BA size doesn't match slot count; can't map
+			}
+			for i, bit := range sample.bits {
+				entry := rows[i].ByRound[round]
+				current := entry.Prevote
+				if isPrecommit {
+					current = entry.Precommit
+				}
+				// Only fill if no individual vote detail was recorded.
+				if current != "" && current != model.VoteAbsent {
+					continue
+				}
+				var kind model.VoteKind
+				if bit == 'x' {
+					switch {
+					case sample.maj23 && sample.maj23Hash != "":
+						kind = model.VoteBlock // block majority
+					case sample.maj23:
+						kind = model.VoteNil // nil majority
+					default:
+						kind = model.VoteBlock // majority not yet reached; best guess
+					}
+				} else {
+					kind = model.VoteAbsent
+				}
+				if isPrecommit {
+					entry.Precommit = kind
+				} else {
+					entry.Prevote = kind
+				}
+				rows[i].ByRound[round] = entry
+			}
+		}
+	}
+	applyBASample(prevoteBA, false)
+	applyBASample(precommitBA, true)
 
 	return rows
 }

@@ -20,6 +20,9 @@ type styles struct {
 	searchBox    lipgloss.Style
 	help         lipgloss.Style
 	error        lipgloss.Style
+	modal        lipgloss.Style
+	modalChoice  lipgloss.Style
+	modalActive  lipgloss.Style
 }
 
 func newStyles(color bool) styles {
@@ -39,6 +42,9 @@ func newStyles(color bool) styles {
 			searchBox:    lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.NormalBorder()),
 			help:         lipgloss.NewStyle().Faint(true),
 			error:        lipgloss.NewStyle().Bold(true),
+			modal:        lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.RoundedBorder()).Bold(true),
+			modalChoice:  base.Border(lipgloss.NormalBorder()),
+			modalActive:  base.Bold(true).Border(lipgloss.NormalBorder()).Underline(true),
 		}
 	}
 
@@ -56,6 +62,9 @@ func newStyles(color bool) styles {
 		searchBox:    lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("67")),
 		help:         lipgloss.NewStyle().Foreground(lipgloss.Color("243")),
 		error:        lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("160")).Padding(0, 1),
+		modal:        lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.DoubleBorder()).BorderForeground(lipgloss.Color("67")).Background(lipgloss.Color("236")).Foreground(lipgloss.Color("230")),
+		modalChoice:  base.Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("241")).Foreground(lipgloss.Color("245")),
+		modalActive:  base.Bold(true).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("160")).Background(lipgloss.Color("160")).Foreground(lipgloss.Color("230")),
 	}
 }
 

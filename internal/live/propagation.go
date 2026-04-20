@@ -9,6 +9,16 @@ import (
 
 const propagationLateThreshold = 500 * time.Millisecond
 
+type receiverRoundKey struct {
+	receiver string
+	round    int
+	voteType string
+}
+
+type receiverRoundState struct {
+	maj23 bool
+}
+
 func BuildPropagation(
 	events []model.Event,
 	h int64,
@@ -48,6 +58,14 @@ func BuildPropagation(
 		}
 	}
 
+	// Track which receiver nodes logged at least one vote receipt for this height.
+	// A receiver with zero receipt events is running at INFO level (or lower) and
+	// simply does not log individual vote receipts — we cannot distinguish
+	// "vote not received" from "vote received but not logged".
+	// We only mark receipts "missing" for receivers that have some receipt data,
+	// because those receivers do log receipts and a gap is a genuine signal.
+	receiversWithData := map[string]bool{}
+	receiverRounds := map[receiverRoundKey]receiverRoundState{}
 	for _, event := range events {
 		if event.Height != h {
 			continue
@@ -56,10 +74,28 @@ func BuildPropagation(
 			continue
 		}
 
+		voteType, _ := event.Fields["_vote_type"].(string)
+		roundKey := receiverRoundKey{
+			receiver: event.Node,
+			round:    event.Round,
+			voteType: voteType,
+		}
+		state := receiverRounds[roundKey]
+		if maj23, _ := event.Fields["_vmaj23"].(bool); maj23 {
+			state.maj23 = true
+		}
+		receiverRounds[roundKey] = state
+
 		key, receivedAt, ok := receivedVoteKey(event, resolver)
 		if !ok {
+			// Event lacks per-vote detail (e.g. gnoland debug logs only carry the
+			// VoteSet BitArray, not individual vote origin). Don't mark this node
+			// as having receipt data — we can't distinguish "not received" from
+			// "received but not logged in this format".
 			continue
 		}
+		// Only count as "has data" when we can actually resolve the vote origin.
+		receiversWithData[event.Node] = true
 
 		row := ensurePropagationRow(prop.Matrix, key, expectedReceivers)
 		receipt, tracked := row[event.Node]
@@ -75,14 +111,109 @@ func BuildPropagation(
 		}
 	}
 
-	for _, row := range prop.Matrix {
-		for _, receipt := range row {
+	// BitArray progression pass: infer per-vote receipt times when the log format
+	// only provides VoteSet BitArray snapshots (no per-vote origin detail).
+	// Each EventAddedPrevote/Precommit on receiver R at time T reports the running
+	// vote-set state; a bit at position i that newly appears as 'x' relative to the
+	// previous snapshot from R means genesis slot i's vote was received around T.
+	if len(resolver.Genesis.Validators) > 0 {
+		// Pre-build index (round, voteType, originNode) → row for O(1) lookup.
+		type rtvKey struct {
+			round    int
+			voteType string
+			origin   string
+		}
+		rowByRTV := make(map[rtvKey]map[string]*model.VoteReceipt, len(prop.Matrix))
+		for k, row := range prop.Matrix {
+			rowByRTV[rtvKey{k.Round, k.VoteType, k.OriginNode}] = row
+		}
+
+		// Running BA state per (receiver, round, voteType).
+		type baKey struct {
+			receiver string
+			round    int
+			voteType string
+		}
+		prevBA := map[baKey]string{}
+
+		for _, ev := range events {
+			if ev.Height != h || !ev.HasTimestamp {
+				continue
+			}
+			if ev.Kind != model.EventAddedPrevote && ev.Kind != model.EventAddedPrecommit {
+				continue
+			}
+			bits, _ := ev.Fields["_vbits"].(string)
+			voteType, _ := ev.Fields["_vote_type"].(string)
+			if bits == "" || voteType == "" {
+				continue
+			}
+
+			bk := baKey{ev.Node, ev.Round, voteType}
+			prev := prevBA[bk]
+			prevBA[bk] = bits
+
+			for i := 0; i < len(bits); i++ {
+				if bits[i] != 'x' {
+					continue
+				}
+				if i < len(prev) && prev[i] == 'x' {
+					continue // already seen in an earlier snapshot
+				}
+				originName := resolver.ResolveByGenesisIndex(i)
+				if originName == "" || originName == ev.Node {
+					continue // self-receipt or unresolvable
+				}
+				row, ok := rowByRTV[rtvKey{ev.Round, voteType, originName}]
+				if !ok {
+					continue // no signed-vote row for this origin
+				}
+				receipt, ok := row[ev.Node]
+				if !ok {
+					if _, wanted := expected[ev.Node]; !wanted {
+						continue
+					}
+					receipt = &model.VoteReceipt{}
+					row[ev.Node] = receipt
+				}
+				if receipt.ReceivedAt.IsZero() || ev.Timestamp.Before(receipt.ReceivedAt) {
+					receipt.ReceivedAt = ev.Timestamp
+				}
+				receiversWithData[ev.Node] = true
+			}
+		}
+	}
+
+	for key, row := range prop.Matrix {
+		for receiver, receipt := range row {
 			switch {
 			case receipt.CastAt.IsZero():
 				receipt.Status = "unknown_cast_time"
 			case receipt.ReceivedAt.IsZero():
-				if gracePassed {
+				// Only report "missing" when the receiver has other receipt events for
+				// this height — meaning it does log receipts and this one is genuinely
+				// absent. If the receiver has no receipt events at all, the log level is
+				// too low to draw conclusions.
+				if gracePassed && receiversWithData[receiver] {
+					if key.VoteType == "precommit" && receiverRounds[receiverRoundKey{
+						receiver: receiver,
+						round:    key.Round,
+						voteType: key.VoteType,
+					}].maj23 {
+						// Once the receiver already logged +2/3 precommits for the round,
+						// an extra precommit that never appears in the logs is not a
+						// reliable propagation miss signal: TM2 often commits immediately
+						// after quorum and never emits a per-vote receipt for the surplus
+						// validator. Keep it visible in the matrix, but suppress incidents.
+						receipt.Status = "quorum-satisfied"
+						break
+					}
 					receipt.Status = "missing"
+				} else if gracePassed {
+					// Grace passed but no receipt events from this node at all —
+					// logs are at INFO level. Mark explicitly so the UI can show "-"
+					// instead of the misleading "pending".
+					receipt.Status = "no-data"
 				}
 			default:
 				latency := receipt.ReceivedAt.Sub(receipt.CastAt)

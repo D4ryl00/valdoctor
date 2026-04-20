@@ -67,9 +67,12 @@ type Model struct {
 	mode      viewMode
 	detailTab detailTab
 
-	paused    bool
-	dirty     bool
-	searching bool
+	paused      bool
+	dirty       bool
+	searching   bool
+	showHelp    bool
+	confirmQuit bool
+	quitYes     bool
 
 	searchQuery    string
 	searchInput    textinput.Model
@@ -184,7 +187,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 
-	if m.mode == viewDetail {
+	if m.mode == viewDetail || m.showHelp {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
@@ -198,14 +201,29 @@ func (m Model) View() string {
 		return "loading..."
 	}
 
-	if m.mode == viewDetail {
-		return renderDetail(m)
+	var view string
+	if m.showHelp {
+		view = renderHelp(m)
+	} else if m.mode == viewDetail {
+		view = renderDetail(m)
+	} else {
+		view = renderDashboard(m)
 	}
-	return renderDashboard(m)
+	if m.confirmQuit {
+		return renderQuitConfirm(m)
+	}
+	return view
 }
 
 func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "ctrl+c":
+		if m.confirmQuit {
+			return *m, tea.Quit
+		}
+		m.confirmQuit = true
+		m.quitYes = false
+		return *m, nil
 	case "esc":
 		m.searching = false
 		m.searchInput.Blur()
@@ -224,9 +242,43 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.confirmQuit {
+		switch msg.String() {
+		case "ctrl+c":
+			return *m, tea.Quit
+		case "left", "h", "shift+tab":
+			m.quitYes = false
+		case "right", "l", "tab":
+			m.quitYes = true
+		case "y", "Y":
+			m.quitYes = true
+			return *m, tea.Quit
+		case "n", "N", "esc", "q":
+			m.confirmQuit = false
+			m.quitYes = false
+		case "enter", " ":
+			if m.quitYes {
+				return *m, tea.Quit
+			}
+			m.confirmQuit = false
+			m.quitYes = false
+		}
+		return *m, nil
+	}
+
+	if m.showHelp {
+		return m.handleHelpKey(msg)
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "q":
-		return *m, tea.Quit
+		m.confirmQuit = true
+		m.quitYes = false
+		return *m, nil
+	case "h":
+		m.showHelp = !m.showHelp
+		m.refreshViewport()
+		return *m, nil
 	case " ":
 		m.paused = !m.paused
 		if !m.paused {
@@ -253,6 +305,31 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return *m, nil
 	}
+}
+
+func (m *Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		m.confirmQuit = true
+		m.quitYes = false
+	case "h", "esc":
+		m.showHelp = false
+		m.refreshViewport()
+	case "j", "down":
+		m.viewport.LineDown(1)
+	case "k", "up":
+		m.viewport.LineUp(1)
+	case "pgdown":
+		m.viewport.ViewDown()
+	case "pgup":
+		m.viewport.ViewUp()
+	case "home":
+		m.viewport.GotoTop()
+	case "end":
+		m.viewport.GotoBottom()
+	}
+
+	return *m, nil
 }
 
 func (m *Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -334,7 +411,9 @@ func (m *Model) reloadSnapshot() {
 		m.incidentSelection = len(items) - 1
 	}
 
-	m.refreshViewport()
+	if !m.showHelp {
+		m.refreshViewport()
+	}
 }
 
 func (m *Model) resizeViewport() {
@@ -351,7 +430,16 @@ func (m *Model) resizeViewport() {
 }
 
 func (m *Model) refreshViewport() {
-	if m.mode != viewDetail || m.viewport.Width == 0 || m.viewport.Height == 0 {
+	if m.viewport.Width == 0 || m.viewport.Height == 0 {
+		return
+	}
+
+	if m.showHelp {
+		m.viewport.SetContent(helpContent(*m))
+		m.viewport.GotoTop()
+		return
+	}
+	if m.mode != viewDetail {
 		return
 	}
 
@@ -366,7 +454,7 @@ func (m *Model) refreshViewport() {
 	case tabConsensus:
 		m.viewport.SetContent(renderConsensusContent(entry, m.color))
 	case tabPropagation:
-		m.viewport.SetContent(renderPropagationContent(entry))
+		m.viewport.SetContent(renderPropagationContent(entry, m.snap.nodes))
 	}
 	m.viewport.GotoTop()
 }

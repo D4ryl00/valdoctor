@@ -73,6 +73,13 @@ type MetadataNode struct {
 	// "http://host:26657"). When set, valdoctor can call /block_results and
 	// /abci_info to enrich findings with live chain state.
 	RPCEndpoint string `toml:"rpc_endpoint,omitempty" json:"rpc_endpoint,omitempty"`
+	// ValsetIndex is the 0-based position of this validator in the active
+	// validator set. Only needed for validators added after genesis via
+	// governance proposals — genesis validators have their index inferred
+	// automatically from the genesis file. When set, it overrides any
+	// genesis-derived index and is used for display ordering and BitArray
+	// slot resolution.
+	ValsetIndex *int `toml:"valset_index,omitempty" json:"valset_index,omitempty"`
 }
 
 type MetadataTopology struct {
@@ -225,6 +232,10 @@ type PeerRoundState struct {
 
 type NodeSummary struct {
 	Name           string     `json:"name"`
+	ShortAddr      string     `json:"short_addr,omitempty"`
+	// GenesisIndex is the validator's position in the genesis validator set (0-based).
+	// -1 means not in genesis / unknown. Used for consistent cross-view ordering.
+	GenesisIndex   int        `json:"genesis_index"`
 	Role           Role       `json:"role"`
 	Files          []string   `json:"files"`
 	Start          time.Time  `json:"start,omitempty"`
@@ -306,6 +317,20 @@ type NodeSummary struct {
 
 	// Log quality.
 	HasDebugLogs bool `json:"has_debug_logs,omitempty"`
+}
+
+// StallThreshold returns the minimum StallDuration that is considered a
+// genuine stall worth reporting. It mirrors the logic in the incident engine:
+// 3× avg block time, capped at a minimum of 10 s.
+func (s NodeSummary) StallThreshold() time.Duration {
+	if s.AvgBlockTime > 0 {
+		threshold := s.AvgBlockTime * 3
+		if threshold < 10*time.Second {
+			return 10 * time.Second
+		}
+		return threshold
+	}
+	return 15 * time.Second
 }
 
 type UnclassifiedEntry struct {

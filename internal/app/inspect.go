@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +49,19 @@ type multiString []string
 
 func (m *multiString) String() string { return strings.Join(*m, ",") }
 func (m *multiString) Set(value string) error {
+	// Expand glob patterns so callers can write --log 'logs/val*.log'.
+	// If the pattern contains no glob metacharacters, or it matches nothing,
+	// keep the original value (filepath.Glob returns nil on no match).
+	if strings.ContainsAny(value, "*?[") {
+		matches, err := filepath.Glob(value)
+		if err != nil {
+			return fmt.Errorf("invalid glob pattern %q: %w", value, err)
+		}
+		if len(matches) > 0 {
+			*m = append(*m, matches...)
+			return nil
+		}
+	}
 	*m = append(*m, value)
 	return nil
 }
@@ -62,7 +76,14 @@ func newInspectCmd(io commands.IO) *commands.Command {
 			ShortHelp:  "inspect genesis and logs and produce a diagnosis report",
 		},
 		cfg,
-		func(ctx context.Context, _ []string) error {
+		func(ctx context.Context, args []string) error {
+			// Positional arguments are treated as additional --log paths so
+			// shell globs work: `val*.log` expands into separate argv entries.
+			for _, arg := range args {
+				if err := cfg.logPaths.Set(arg); err != nil {
+					return fmt.Errorf("invalid log path %q: %w", arg, err)
+				}
+			}
 			return execInspect(ctx, cfg, io)
 		},
 	)

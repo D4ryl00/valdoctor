@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -258,7 +257,7 @@ func (s *SQLiteStore) SetNodeStates(states []model.NodeState) {
 }
 
 func (s *SQLiteStore) NodeStates() []model.NodeState {
-	rows, err := s.db.Query(`SELECT payload FROM nodes ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT payload FROM nodes`)
 	if err != nil {
 		return nil
 	}
@@ -276,6 +275,7 @@ func (s *SQLiteStore) NodeStates() []model.NodeState {
 		}
 		out = append(out, state)
 	}
+	sortNodeStates(out)
 	return out
 }
 
@@ -370,9 +370,7 @@ func (s *SQLiteStore) incidentsByStatus(status string, limit int) []model.Incide
 		}
 		out = append(out, card)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].UpdatedAt.After(out[j].UpdatedAt)
-	})
+	sortIncidentCards(out)
 	return out
 }
 

@@ -154,6 +154,7 @@ func buildValidatorSlots(genesis model.Genesis, meta model.Metadata) []model.Val
 func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsByNode map[string]NodePeerStats) []model.NodeSummary {
 	summaries := map[string]*model.NodeSummary{}
 	firstCommitByNode := map[string]time.Time{}
+	signerSuccessByNode := map[string]bool{}
 	// Per-node: height → max round seen at that height.
 	maxRoundByNode := map[string]map[int64]int{}
 
@@ -277,6 +278,8 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 			summary.SignerFailureCount++
 		case model.EventRemoteSignerConnect:
 			summary.SignerConnectCount++
+		case model.EventRemoteSignerSuccess:
+			signerSuccessByNode[event.Node] = true
 		case model.EventDialFailure:
 			summary.DialFailureCount++
 		}
@@ -303,6 +306,9 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 
 	// Second pass: compute derived timing fields now that all events are consumed.
 	for name, summary := range summaries {
+		if summary.SignerConnectCount == 0 && signerSuccessByNode[name] {
+			summary.SignerConnectCount = 1
+		}
 		if summary.CommitCount >= 2 && !summary.LastCommitTime.IsZero() {
 			if first, ok := firstCommitByNode[name]; ok {
 				span := summary.LastCommitTime.Sub(first)
@@ -352,6 +358,10 @@ func buildNodeSummaries(sources []model.Source, events []model.Event, peerStatsB
 				return states[i].Peer < states[j].Peer
 			})
 			summary.PeerStates = states
+			if summary.CurrentPeers == 0 && summary.MaxPeers == 0 {
+				summary.CurrentPeers = len(states)
+				summary.MaxPeers = len(states)
+			}
 		}
 		summaries[name] = summary
 	}

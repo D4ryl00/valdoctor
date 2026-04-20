@@ -27,9 +27,12 @@ type Coordinator struct {
 	OnIncidentUpdate func(model.IncidentCard)
 
 	mu               sync.Mutex
+	rebuildMu        sync.Mutex // serializes rebuildHeight; prevents races in IncidentEngine.cards
 	rebuildGen       map[int64]int
 	closedAt         map[int64]time.Time
 	finalizeObserved map[int64]map[string]time.Time
+	lineSeenAt       map[string]time.Time
+	peerStatsByNode  map[string]parse.ParseStats
 	resolver         *IdentityResolver
 	incidents        IncidentEngine
 }
@@ -49,6 +52,12 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 	if c.finalizeObserved == nil {
 		c.finalizeObserved = map[int64]map[string]time.Time{}
+	}
+	if c.lineSeenAt == nil {
+		c.lineSeenAt = map[string]time.Time{}
+	}
+	if c.peerStatsByNode == nil {
+		c.peerStatsByNode = map[string]parse.ParseStats{}
 	}
 	if c.resolver == nil {
 		c.resolver = &IdentityResolver{
@@ -80,10 +89,16 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	c.flushRebuilds()
+	c.refreshNodeStatesWithMode(true)
+	c.refreshIncidents()
 	return nil
 }
 
 func (c *Coordinator) handleLine(line source.Line) {
+	c.mu.Lock()
+	c.lineSeenAt[line.Node] = time.Now().UTC()
+	c.mu.Unlock()
+
 	src := model.Source{
 		Path: line.Path,
 		Node: line.Node,
@@ -91,10 +106,22 @@ func (c *Coordinator) handleLine(line source.Line) {
 	}
 
 	event, _ := parse.ParseLogLine(src, line.Raw, line.LineNo)
+	c.observePeerGossip(event)
 	if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
 		return
 	}
 
+	// Events like peer-add/drop and remote-signer events carry no block height.
+	// The store discards events with Height == 0, so we attach them to the
+	// current tip (or height 1 before any commit is seen) so that
+	// BuildNodeSummaries can count them when refreshing node states.
+	if event.Height <= 0 {
+		tip := c.Store.CurrentTip()
+		if tip <= 0 {
+			tip = 1
+		}
+		event.Height = tip
+	}
 	_ = c.Store.AppendEvent(event)
 
 	if event.Height > 0 {
@@ -112,6 +139,18 @@ func (c *Coordinator) handleLine(line source.Line) {
 	if event.Kind == model.EventFinalizeCommit {
 		c.observeFinalizeCommit(event)
 	}
+}
+
+func (c *Coordinator) observePeerGossip(event model.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats := c.peerStatsByNode[event.Node]
+	if stats.PeerRoundStates == nil {
+		stats.PeerRoundStates = map[string]model.PeerRoundState{}
+	}
+	parse.CollectPeerGossip(event, &stats)
+	c.peerStatsByNode[event.Node] = stats
 }
 
 func (c *Coordinator) observeFinalizeCommit(event model.Event) {
@@ -180,6 +219,9 @@ func (c *Coordinator) scheduleGraceRebuild(height int64) {
 }
 
 func (c *Coordinator) rebuildHeight(height int64) {
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
+
 	events := c.Store.EventsForHeight(height)
 	if len(events) == 0 {
 		return
@@ -219,6 +261,10 @@ func (c *Coordinator) rebuildHeight(height int64) {
 }
 
 func (c *Coordinator) refreshNodeStates() {
+	c.refreshNodeStatesWithMode(false)
+}
+
+func (c *Coordinator) refreshNodeStatesWithMode(forceWallClock bool) {
 	tip := c.Store.CurrentTip()
 	if tip <= 0 {
 		return
@@ -235,16 +281,84 @@ func (c *Coordinator) refreshNodeStates() {
 	}
 	sortEvents(events)
 
-	summaries := analyze.BuildNodeSummaries(c.Sources, events, nil)
+	summaries := analyze.BuildNodeSummaries(c.Sources, events, c.snapshotPeerStats())
 
-	// In live mode a validator that stops logging will have StallDuration ≈ 0
-	// because BuildNodeSummaries measures stall against the node's own last event
-	// timestamp rather than the current time. Override StallDuration for any
-	// validator that is behind the chain tip so stall incidents fire correctly.
+	// Enrich summaries with identity info from the resolver: full validator
+	// address (for display) and genesis index (for consistent ordering).
+	for i := range summaries {
+		identity, ok := c.resolver.ResolveByNode(summaries[i].Name)
+		if !ok {
+			summaries[i].GenesisIndex = -1
+			continue
+		}
+		if summaries[i].ShortAddr == "" {
+			if identity.FullAddr != "" {
+				summaries[i].ShortAddr = identity.FullAddr
+			} else {
+				summaries[i].ShortAddr = identity.ShortAddr
+			}
+		}
+		summaries[i].GenesisIndex = identity.GenesisIndex
+	}
+
 	now := time.Now().UTC()
+	observedHorizon := time.Time{}
+	catchUpThreshold := 30 * time.Second
+	for _, summary := range summaries {
+		if summary.End.After(observedHorizon) {
+			observedHorizon = summary.End
+		}
+		if summary.AvgBlockTime > 0 {
+			if horizon := summary.AvgBlockTime * 5; horizon > catchUpThreshold {
+				catchUpThreshold = horizon
+			}
+		}
+	}
+
+	// In live mode, BuildNodeSummaries measures StallDuration as
+	// (End - LastCommitTime) where End is the node's most recent log timestamp.
+	// For a stopped node, End ≈ LastCommitTime → StallDuration ≈ 0, so stall
+	// incidents never fire. Once the stream has caught up near real time, extend
+	// the stall window to wall clock so genuinely silent validators are reported.
+	// While historical backlogs are still replaying, suppress this live-mode
+	// extension entirely: per-source replay skew can make healthy validators look
+	// dozens of heights behind even though the issue is just ingestion ordering.
+	replayingHistory := !forceWallClock && !observedHorizon.IsZero() && now.Sub(observedHorizon) > catchUpThreshold
+	if replayingHistory {
+		states := make([]model.NodeState, 0, len(summaries))
+		for _, summary := range summaries {
+			states = append(states, model.NodeState{
+				Summary:   summary,
+				UpdatedAt: now,
+			})
+		}
+		c.Store.SetNodeStates(states)
+		return
+	}
+
 	for i, summary := range summaries {
-		if summary.Role == model.RoleValidator && summary.HighestCommit < tip && !summary.LastCommitTime.IsZero() {
-			if stall := now.Sub(summary.LastCommitTime); stall > summary.StallDuration {
+		if summary.Role != model.RoleValidator {
+			continue
+		}
+		if summary.HighestCommit >= tip || summary.LastCommitTime.IsZero() {
+			continue
+		}
+		// Determine "silence" grace: one avg block time, min 2 s.
+		grace := summary.AvgBlockTime
+		if grace < 2*time.Second {
+			grace = 2 * time.Second
+		}
+		ingestGrace := grace
+		if ingestGrace > 5*time.Second {
+			ingestGrace = 5 * time.Second
+		}
+		if !forceWallClock && c.nodeRecentlySeen(summary.Name, now, ingestGrace) {
+			continue
+		}
+		// If the node's last log event is older than the grace window, the node
+		// has stopped emitting logs → extend StallDuration out to wall clock.
+		if summary.End.IsZero() || now.Sub(summary.End) >= grace {
+			if stall := now.Sub(summary.LastCommitTime); stall > summaries[i].StallDuration {
 				summaries[i].StallDuration = stall
 			}
 		}
@@ -258,6 +372,40 @@ func (c *Coordinator) refreshNodeStates() {
 		})
 	}
 	c.Store.SetNodeStates(states)
+}
+
+func (c *Coordinator) nodeRecentlySeen(node string, now time.Time, grace time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	seenAt := c.lineSeenAt[node]
+	if seenAt.IsZero() {
+		return false
+	}
+	return now.Sub(seenAt) < grace
+}
+
+func (c *Coordinator) snapshotPeerStats() map[string]analyze.NodePeerStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.peerStatsByNode) == 0 {
+		return nil
+	}
+
+	out := make(map[string]analyze.NodePeerStats, len(c.peerStatsByNode))
+	for node, ps := range c.peerStatsByNode {
+		roundStates := make(map[string]model.PeerRoundState, len(ps.PeerRoundStates))
+		for peer, state := range ps.PeerRoundStates {
+			roundStates[peer] = state
+		}
+		out[node] = analyze.NodePeerStats{
+			MaxVoteHeight: ps.MaxPeerVoteHeight,
+			RoundStates:   roundStates,
+			StuckHeight:   ps.StuckHeight,
+		}
+	}
+	return out
 }
 
 func (c *Coordinator) pruneState(tip int64) {

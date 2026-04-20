@@ -48,6 +48,25 @@ chain_id = "mychain-1"
     validator_pubkey  = "gpub1..."
     rpc_endpoint      = "http://validator-b.example.com:26657"
 
+  # Example: a validator added after genesis via a governance proposal.
+  # Genesis validators have their valset index inferred automatically from
+  # genesis.json. Post-genesis validators must declare it explicitly here.
+  #
+  # valset_index is the 0-based position of this validator in the TM2 active
+  # validator set (ordered by descending voting power, then address).
+  # It is used for:
+  #   - consistent ordering in all TUI views (Nodes section, propagation matrix)
+  #   - BitArray slot resolution in vote propagation tracking
+  #
+  # Example: if genesis has 4 validators (slots 0–3) and this validator was
+  # added as the 5th, set valset_index = 4.
+  [nodes.validator_c]
+    role             = "validator"
+    files            = ["logs/validator_c.log"]
+    validator_name   = "Validator C"
+    validator_address = "g1ghi789..."
+    valset_index     = 4   # 5th slot in the active validator set (0-based)
+
   [nodes.sentry_a]
     role  = "sentry"
     files = ["logs/sentry_a.log"]

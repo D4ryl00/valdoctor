@@ -62,6 +62,39 @@ func TestBuildLiveSourcesIncludesCmdSources(t *testing.T) {
 	require.Equal(t, model.RoleSentry, s1.Role)
 }
 
+func TestBuildLiveSourcesPromotesDockerLogsCmdToDockerSource(t *testing.T) {
+	cfg := &liveCfg{
+		validatorCmds: multiString{`val4=docker logs --follow valdoctor-five-validator-faults-val4-1`},
+	}
+
+	sources, err := buildLiveSources(cfg, model.Metadata{})
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+
+	require.Equal(t, "docker:valdoctor-five-validator-faults-val4-1", sources[0].Path)
+	require.Equal(t, "val4", sources[0].Node)
+	require.Equal(t, model.RoleValidator, sources[0].Role)
+}
+
+func TestParseDockerLogsCommand(t *testing.T) {
+	container, ok := parseDockerLogsCommand([]string{"docker", "logs", "--follow", "validator-a"})
+	require.True(t, ok)
+	require.Equal(t, "validator-a", container)
+
+	container, ok = parseDockerLogsCommand([]string{"docker", "logs", "-f", "--tail", "0", "validator-b"})
+	require.True(t, ok)
+	require.Equal(t, "validator-b", container)
+
+	_, ok = parseDockerLogsCommand([]string{"ssh", "user@host", "journalctl", "-f"})
+	require.False(t, ok)
+
+	_, ok = parseDockerLogsCommand([]string{"docker", "logs", "--since"})
+	require.False(t, ok)
+
+	_, ok = parseDockerLogsCommand([]string{"docker", "logs", "--unknown", "validator-c"})
+	require.False(t, ok)
+}
+
 func TestParseCmdBindingsExtractsCommandSlices(t *testing.T) {
 	cmds, err := parseCmdBindings(
 		[]string{`gen=echo hello`},

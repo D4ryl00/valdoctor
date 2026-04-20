@@ -40,10 +40,11 @@ var (
 	peerAddrRE = regexp.MustCompile(`\} (g1[a-z0-9]{38,}) `)
 	// voteDetailRE extracts validator index, address fingerprint, and block hash
 	// from "Added to prevote/precommit" messages (console/VoteSet inline format).
-	// TM2 vote string format: Vote{IDX:ADDRSHORT HEIGHT/ROUND(TYPE) HASH}
+	// TM2 vote string format: Vote{IDX:ADDRSHORT HEIGHT/ROUND[/TYPE](TypeName) HASH}
 	// ADDRSHORT is the first 6 bytes of the validator address (12 hex chars).
 	// HASH is a hex string or "<nil>" for nil votes.
-	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):([0-9A-Fa-f]+) \d+/\d+\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
+	// The optional /TYPE integer before (TypeName) is present in some gnoland versions.
+	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):([0-9A-Fa-f]+) \d+/\d+(?:/\d+)?\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
 	// voteReceiveRE extracts validator index, address fingerprint, height, round,
 	// type name, and block hash from "Receive" (consensus) messages.
 	// Format: [Vote Vote{IDX:ADDRSHORT HEIGHT/ROUND/TYPE(TypeName) BLOCKHASH SIG @ TS}]
@@ -88,6 +89,7 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, ma
 			continue
 		}
 		event, warning := ParseLogLine(source, raw, lineNo)
+		collectPeerGossip(event, &stats)
 		if warning != "" {
 			if event.Kind == model.EventUnknown {
 				key := NormalizeMessage(event.Message)
@@ -104,9 +106,6 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, ma
 			}
 		}
 		if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
-			if event.Kind == model.EventKnownNoise {
-				collectPeerGossip(event, &stats)
-			}
 			continue
 		}
 		events = append(events, event)
@@ -120,6 +119,11 @@ func ParseLogFile(source model.Source, r io.Reader) ([]model.Event, []string, ma
 // "No votes to send, sleeping" messages are inspected; everything else is skipped.
 func collectPeerGossip(event model.Event, stats *ParseStats) {
 	msg := event.Message
+	if fieldsMsg, ok := event.Fields["msg"].(string); ok {
+		if strings.HasPrefix(fieldsMsg, "[NewRoundStep ") || strings.HasPrefix(fieldsMsg, "[Vote ") {
+			msg = fieldsMsg
+		}
+	}
 	if strings.Contains(msg, "No votes to send") {
 		// rs.Height reveals the height the node is currently stuck trying to commit.
 		// JSON numbers decode as float64; convert carefully.
@@ -153,6 +157,13 @@ func collectPeerGossip(event model.Event, stats *ParseStats) {
 			stats.PeerRoundStates[peer] = model.PeerRoundState{Peer: peer, Height: h, Round: r, Step: step}
 		}
 	}
+}
+
+// CollectPeerGossip updates ParseStats from a parsed event.
+// It is used by live mode, where known-noise events are not stored but still
+// need to contribute peer-gossip state.
+func CollectPeerGossip(event model.Event, stats *ParseStats) {
+	collectPeerGossip(event, stats)
 }
 
 // extractPeerAddr pulls the bech32 peer address (g1xxx…) from the "src" field

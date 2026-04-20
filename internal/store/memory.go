@@ -2,7 +2,6 @@ package store
 
 import (
 	"slices"
-	"sort"
 	"sync"
 
 	"github.com/D4ryl00/valdoctor/internal/model"
@@ -159,9 +158,7 @@ func (s *MemoryStore) NodeStates() []model.NodeState {
 	for _, state := range s.nodes {
 		out = append(out, state)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Summary.Name < out[j].Summary.Name
-	})
+	sortNodeStates(out)
 	return out
 }
 
@@ -219,9 +216,7 @@ func (s *MemoryStore) incidentsByStatus(status string, limit int) []model.Incide
 			out = append(out, card)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].UpdatedAt.After(out[j].UpdatedAt)
-	})
+	sortIncidentCards(out)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}

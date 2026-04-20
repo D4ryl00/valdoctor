@@ -58,7 +58,16 @@ func newLiveCmd(io commands.IO) *commands.Command {
 			ShortHelp:  "ingest running node logs in real time and keep bounded live state",
 		},
 		cfg,
-		func(ctx context.Context, _ []string) error {
+		func(ctx context.Context, args []string) error {
+			// Positional arguments are treated as additional --log paths.
+			// This lets shell globs work naturally: the shell expands
+			// `val*.log` into separate argv entries before flag.Parse runs,
+			// and those entries land here rather than in logPaths.
+			for _, arg := range args {
+				if err := cfg.logPaths.Set(arg); err != nil {
+					return fmt.Errorf("invalid log path %q: %w", arg, err)
+				}
+			}
 			return execLive(ctx, cfg, io)
 		},
 	)
@@ -139,9 +148,48 @@ func execLive(ctx context.Context, cfg *liveCfg, io commands.IO) error {
 		return err
 	}
 
-	logSources := make([]source.LogSource, 0, len(sources))
+	// First pass: identify which sources are validators.
+	// If none are explicitly identified (e.g. all provided via --log without
+	// --role or metadata), promote all unknown-role sources to RoleValidator so
+	// that height closure, propagation tracking, and node role display work.
 	validatorSources := make([]string, 0)
 	seenValidators := map[string]struct{}{}
+	for _, src := range sources {
+		if src.Role == model.RoleValidator {
+			if _, ok := seenValidators[src.Node]; !ok {
+				seenValidators[src.Node] = struct{}{}
+				validatorSources = append(validatorSources, src.Node)
+			}
+		}
+	}
+	if len(validatorSources) == 0 {
+		for i := range sources {
+			if sources[i].Role == model.RoleUnknown {
+				sources[i].Role = model.RoleValidator
+			}
+			if _, ok := seenValidators[sources[i].Node]; !ok {
+				seenValidators[sources[i].Node] = struct{}{}
+				validatorSources = append(validatorSources, sources[i].Node)
+			}
+		}
+	}
+	// Sort by genesis validator index when available, fall back to alphabetical.
+	tmpResolver := &live.IdentityResolver{
+		Genesis:  genesis,
+		Metadata: metadata,
+		Sources:  sources,
+	}
+	sort.SliceStable(validatorSources, func(i, j int) bool {
+		return live.GenesisLess(
+			tmpResolver.GenesisIndexOf(validatorSources[i]),
+			tmpResolver.GenesisIndexOf(validatorSources[j]),
+			validatorSources[i],
+			validatorSources[j],
+		)
+	})
+
+	// Second pass: create LogSource wrappers (roles are now final).
+	logSources := make([]source.LogSource, 0, len(sources))
 	for _, src := range sources {
 		switch {
 		case isDockerSourcePath(src.Path):
@@ -161,14 +209,7 @@ func execLive(ctx context.Context, cfg *liveCfg, io commands.IO) error {
 				Since:  since,
 			})
 		}
-		if src.Role == model.RoleValidator {
-			if _, ok := seenValidators[src.Node]; !ok {
-				seenValidators[src.Node] = struct{}{}
-				validatorSources = append(validatorSources, src.Node)
-			}
-		}
 	}
-	sort.Strings(validatorSources)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -280,6 +321,37 @@ func parseCmdBindings(generic, validators, sentries []string) (map[string][]stri
 		out[source.CmdSourcePath(name)] = words
 	}
 	return out, nil
+}
+
+func parseDockerLogsCommand(words []string) (string, bool) {
+	if len(words) < 3 || words[0] != "docker" || words[1] != "logs" {
+		return "", false
+	}
+
+	container := ""
+	for i := 2; i < len(words); i++ {
+		word := words[i]
+		switch {
+		case word == "-f" || word == "--follow" || word == "-t" || word == "--timestamps":
+			continue
+		case strings.HasPrefix(word, "--tail="), strings.HasPrefix(word, "--since="):
+			continue
+		case word == "--tail" || word == "--since":
+			i++
+			if i >= len(words) || strings.TrimSpace(words[i]) == "" {
+				return "", false
+			}
+			continue
+		case strings.HasPrefix(word, "-"):
+			return "", false
+		case container == "":
+			container = word
+		default:
+			return "", false
+		}
+	}
+
+	return container, container != ""
 }
 
 func parseClosurePolicy(raw string) (model.ClosurePolicy, error) {
@@ -467,7 +539,14 @@ func buildCmdSources(generic, validators, sentries, roleBindings []string, meta 
 		if rawCmd == "" {
 			return nil, fmt.Errorf("invalid cmd source %q: command must not be empty", item.raw)
 		}
+		words := strings.Fields(rawCmd)
+		if len(words) == 0 {
+			return nil, fmt.Errorf("invalid cmd source %q: command must not be empty", item.raw)
+		}
 		path := source.CmdSourcePath(name)
+		if container, ok := parseDockerLogsCommand(words); ok {
+			path = dockerSourcePath(container)
+		}
 		src, ok := seen[path]
 		if !ok {
 			role := item.role

@@ -2,6 +2,7 @@ package live
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,6 +12,26 @@ import (
 
 type IncidentEngine struct {
 	cards map[string]model.IncidentCard
+}
+
+const propagationIncidentActiveWindow = 2
+const remoteSignerIncidentMinWindow = 10 * time.Second
+
+type recentSignerStats struct {
+	failures  int
+	connects  int
+	firstSeen time.Time
+	lastSeen  time.Time
+	firstH    int64
+	lastH     int64
+}
+
+func remoteSignerIncidentWindow(avgBlock time.Duration) time.Duration {
+	window := avgBlock * 5
+	if window < remoteSignerIncidentMinWindow {
+		window = remoteSignerIncidentMinWindow
+	}
+	return window
 }
 
 func (e *IncidentEngine) Reconcile(
@@ -81,8 +102,49 @@ func detectActiveIncidents(
 	now time.Time,
 ) map[string]model.IncidentCard {
 	active := map[string]model.IncidentCard{}
+	summariesByNode := map[string]model.NodeSummary{}
+	recentSignerByNode := map[string]recentSignerStats{}
+
+	for _, node := range nodes {
+		summariesByNode[node.Summary.Name] = node.Summary
+	}
 
 	for _, event := range events {
+		switch event.Kind {
+		case model.EventRemoteSignerFailure, model.EventRemoteSignerConnect:
+			summary, ok := summariesByNode[event.Node]
+			if !ok {
+				break
+			}
+			if !event.HasTimestamp || summary.End.IsZero() {
+				break
+			}
+			if age := summary.End.Sub(event.Timestamp); age < 0 || age > remoteSignerIncidentWindow(summary.AvgBlockTime) {
+				break
+			}
+			stats := recentSignerByNode[event.Node]
+			if stats.firstSeen.IsZero() || event.Timestamp.Before(stats.firstSeen) {
+				stats.firstSeen = event.Timestamp
+			}
+			if event.Timestamp.After(stats.lastSeen) {
+				stats.lastSeen = event.Timestamp
+			}
+			if event.Height > 0 {
+				if stats.firstH == 0 || event.Height < stats.firstH {
+					stats.firstH = event.Height
+				}
+				if event.Height > stats.lastH {
+					stats.lastH = event.Height
+				}
+			}
+			if event.Kind == model.EventRemoteSignerFailure {
+				stats.failures++
+			} else {
+				stats.connects++
+			}
+			recentSignerByNode[event.Node] = stats
+		}
+
 		if event.Kind != model.EventConsensusFailure {
 			continue
 		}
@@ -127,7 +189,7 @@ func detectActiveIncidents(
 			}
 		}
 
-		if summary.Role == model.RoleValidator && tip > summary.HighestCommit && summary.StallDuration >= stallThreshold(summary) {
+		if summary.Role == model.RoleValidator && tip > summary.HighestCommit && summary.StallDuration >= summary.StallThreshold() {
 			id := "stalled-validator-" + summary.Name
 			active[id] = model.IncidentCard{
 				ID:          id,
@@ -143,8 +205,23 @@ func detectActiveIncidents(
 			}
 		}
 
-		if summary.SignerFailureCount >= 2 || (summary.SignerFailureCount >= 1 && summary.SignerConnectCount >= 1) {
+		if stats := recentSignerByNode[summary.Name]; stats.failures >= 2 || (stats.failures >= 1 && stats.connects >= 1) {
 			id := "remote-signer-instability-" + summary.Name
+			firstHeight := stats.firstH
+			lastHeight := stats.lastH
+			if lastHeight == 0 {
+				switch {
+				case summary.LastHeight > 0:
+					lastHeight = summary.LastHeight
+				case summary.HighestCommit > 0:
+					lastHeight = summary.HighestCommit
+				default:
+					lastHeight = tip
+				}
+			}
+			if firstHeight == 0 {
+				firstHeight = lastHeight
+			}
 			active[id] = model.IncidentCard{
 				ID:          id,
 				Kind:        "remote-signer-instability",
@@ -152,30 +229,68 @@ func detectActiveIncidents(
 				Status:      "active",
 				Scope:       summary.Name,
 				Title:       fmt.Sprintf("Remote signer instability on %s", summary.Name),
-				Summary:     fmt.Sprintf("%d signer failure(s) and %d reconnect(s) observed.", summary.SignerFailureCount, summary.SignerConnectCount),
-				FirstHeight: summary.LastHeight,
-				LastHeight:  summary.LastHeight,
+				Summary:     fmt.Sprintf("%d signer failure(s) and %d reconnect(s) observed recently.", stats.failures, stats.connects),
+				FirstHeight: firstHeight,
+				LastHeight:  lastHeight,
 				UpdatedAt:   now,
 			}
 		}
 	}
 
 	for _, height := range heights {
-		for key, receivers := range height.Propagation.Matrix {
-			for receiver, receipt := range receivers {
-				switch receipt.Status {
-				case "missing":
-					id := fmt.Sprintf("vote-propagation-miss-%s-%s", key.OriginNode, receiver)
-					active[id] = aggregatePropagationCard(active[id], now, id, "vote-propagation-miss", model.SeverityHigh, key, receiver, "missing")
-				case "late":
-					id := fmt.Sprintf("vote-propagation-late-%s-%s", key.OriginNode, receiver)
-					active[id] = aggregatePropagationCard(active[id], now, id, "vote-propagation-late", model.SeverityMedium, key, receiver, "late")
-				}
-			}
+		if tip-height.Height > propagationIncidentActiveWindow {
+			continue
 		}
+		accumulatePropagationIncidents(active, height, nodes, tip, now)
 	}
 
 	return active
+}
+
+func accumulatePropagationIncidents(active map[string]model.IncidentCard, height model.HeightEntry, nodes []model.NodeState, tip int64, now time.Time) {
+	receiverStates := map[string]model.NodeSummary{}
+	validatorCount := 0
+	for _, node := range nodes {
+		receiverStates[node.Summary.Name] = node.Summary
+		if node.Summary.Role == model.RoleValidator {
+			validatorCount++
+		}
+	}
+
+	for key, receivers := range height.Propagation.Matrix {
+		missingReceivers := make([]string, 0)
+		for receiver, receipt := range receivers {
+			switch receipt.Status {
+			case "missing":
+				missingReceivers = append(missingReceivers, receiver)
+			case "late":
+				id := fmt.Sprintf("vote-propagation-late-%s-%s-%s", key.OriginNode, receiver, key.VoteType)
+				active[id] = aggregatePropagationCard(active[id], now, id, "vote-propagation-late", model.SeverityMedium, key, receiver, "late")
+			}
+		}
+
+		switch len(missingReceivers) {
+		case 0:
+			continue
+		case 1:
+			receiver := missingReceivers[0]
+			id := fmt.Sprintf("vote-propagation-miss-%s-%s-%s", key.OriginNode, receiver, key.VoteType)
+			active[id] = aggregatePropagationCard(
+				active[id],
+				now,
+				id,
+				"vote-propagation-miss",
+				propagationMissSeverity(receiverStates[receiver], tip, false, len(missingReceivers), validatorCount),
+				key,
+				receiver,
+				"missing",
+			)
+		default:
+			sort.Strings(missingReceivers)
+			id := fmt.Sprintf("vote-propagation-miss-multi-%s-%s-h%d-r%d", key.OriginNode, key.VoteType, key.Height, key.Round)
+			active[id] = propagationBroadcastMissCard(now, id, key, missingReceivers, receiverStates, tip, validatorCount)
+		}
+	}
 }
 
 func aggregatePropagationCard(existing model.IncidentCard, now time.Time, id, kind string, severity model.Severity, key model.VoteKey, receiver, status string) model.IncidentCard {
@@ -185,7 +300,7 @@ func aggregatePropagationCard(existing model.IncidentCard, now time.Time, id, ki
 		Severity:    severity,
 		Status:      "active",
 		Scope:       receiver,
-		Title:       fmt.Sprintf("%s receipts from %s to %s", strings.Title(strings.ReplaceAll(status, "-", " ")), key.OriginNode, receiver),
+		Title:       fmt.Sprintf("%s %s receipts from %s to %s", strings.Title(strings.ReplaceAll(status, "-", " ")), key.VoteType, key.OriginNode, receiver),
 		Summary:     fmt.Sprintf("%s vote receipts observed for %s %s at h%d/r%d.", status, key.OriginNode, key.VoteType, key.Height, key.Round),
 		FirstHeight: key.Height,
 		LastHeight:  key.Height,
@@ -198,10 +313,55 @@ func aggregatePropagationCard(existing model.IncidentCard, now time.Time, id, ki
 			card.FirstHeight = key.Height
 		}
 		card.LastHeight = max(card.LastHeight, existing.LastHeight)
-		card.Summary = fmt.Sprintf("%s receipts observed for %s %s on heights %d-%d.", status, key.OriginNode, key.VoteType, card.FirstHeight, card.LastHeight)
+		card.Summary = fmt.Sprintf("%s %s receipts observed for %s on heights %d-%d toward %s.", status, key.VoteType, key.OriginNode, card.FirstHeight, card.LastHeight, receiver)
 	}
 
 	return card
+}
+
+func propagationBroadcastMissCard(now time.Time, id string, key model.VoteKey, receivers []string, receiverStates map[string]model.NodeSummary, tip int64, validatorCount int) model.IncidentCard {
+	label := fmt.Sprintf("%d validators", len(receivers))
+	if len(receivers) == 2 {
+		label = strings.Join(receivers, " and ")
+	}
+
+	severity := model.SeverityMedium
+	for _, receiver := range receivers {
+		if propagationMissSeverity(receiverStates[receiver], tip, true, len(receivers), validatorCount) == model.SeverityHigh {
+			severity = model.SeverityHigh
+			break
+		}
+	}
+
+	return model.IncidentCard{
+		ID:          id,
+		Kind:        "vote-propagation-miss-broadcast",
+		Severity:    severity,
+		Status:      "active",
+		Scope:       fmt.Sprintf("h%d/r%d", key.Height, key.Round),
+		Title:       fmt.Sprintf("Missing %s receipts from %s to %s", key.VoteType, key.OriginNode, label),
+		Summary:     fmt.Sprintf("%s did not log %s receipts on %s at h%d/r%d.", strings.Join(receivers, ", "), key.VoteType, key.OriginNode, key.Height, key.Round),
+		FirstHeight: key.Height,
+		LastHeight:  key.Height,
+		UpdatedAt:   now,
+	}
+}
+
+func propagationMissSeverity(receiver model.NodeSummary, tip int64, multi bool, impactedReceivers, validatorCount int) model.Severity {
+	if receiver.Name != "" && receiver.Role == model.RoleValidator && receiver.HighestCommit < tip {
+		threshold := 2
+		if validatorCount/2 > threshold {
+			threshold = validatorCount / 2
+		}
+		if multi && impactedReceivers >= threshold {
+			return model.SeverityHigh
+		}
+		return model.SeverityHigh
+	}
+	if multi {
+		return model.SeverityMedium
+	}
+	return model.SeverityLow
 }
 
 func cardsEqual(a, b model.IncidentCard) bool {
@@ -214,17 +374,6 @@ func cardsEqual(a, b model.IncidentCard) bool {
 		a.Summary == b.Summary &&
 		a.FirstHeight == b.FirstHeight &&
 		a.LastHeight == b.LastHeight
-}
-
-func stallThreshold(summary model.NodeSummary) time.Duration {
-	if summary.AvgBlockTime > 0 {
-		threshold := summary.AvgBlockTime * 3
-		if threshold < 10*time.Second {
-			return 10 * time.Second
-		}
-		return threshold
-	}
-	return 15 * time.Second
 }
 
 func max(a, b int64) int64 {

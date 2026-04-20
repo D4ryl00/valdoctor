@@ -272,7 +272,7 @@ func writeVoteGrid(b *strings.Builder, c colorizer, rows []model.ValidatorVoteRo
 		roundNums[i] = rs.Round
 	}
 
-	const colVal = 18
+	const colVal = 28
 	// Build header: Validator | R0 pv | R0 pc | R1 pv | …
 	var hdr strings.Builder
 	fmt.Fprintf(&hdr, " %-*s", colVal, "Validator [idx]")
@@ -285,7 +285,11 @@ func writeVoteGrid(b *strings.Builder, c colorizer, rows []model.ValidatorVoteRo
 
 	hasLate := false
 	for _, vr := range rows {
-		label := fmt.Sprintf("%s [%d]", truncate(vr.Name, colVal-5), vr.Index)
+		addrSuffix := ""
+		if len(vr.Addr) >= 6 {
+			addrSuffix = "(" + vr.Addr[:6] + ")"
+		}
+		label := fmt.Sprintf("%s%s [%d]", truncate(vr.Name, 14), addrSuffix, vr.Index)
 		var line strings.Builder
 		fmt.Fprintf(&line, " %-*s", colVal, label)
 		for _, r := range roundNums {
