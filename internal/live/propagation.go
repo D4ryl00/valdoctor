@@ -7,8 +7,6 @@ import (
 	"github.com/D4ryl00/valdoctor/internal/model"
 )
 
-const propagationLateThreshold = 500 * time.Millisecond
-
 type receiverRoundKey struct {
 	receiver string
 	round    int
@@ -18,6 +16,40 @@ type receiverRoundKey struct {
 type receiverRoundState struct {
 	maj23   bool
 	maj23At time.Time
+	maj23Seq int
+}
+
+type receiptEvidence struct {
+	firstSeq int
+	bitSeq   int
+}
+
+func ensureReceiptEvidence(meta map[*model.VoteReceipt]*receiptEvidence, receipt *model.VoteReceipt) *receiptEvidence {
+	if evidence, ok := meta[receipt]; ok {
+		return evidence
+	}
+	evidence := &receiptEvidence{}
+	meta[receipt] = evidence
+	return evidence
+}
+
+func recordReceiptSequence(meta map[*model.VoteReceipt]*receiptEvidence, receipt *model.VoteReceipt, seq int, fromBitArray bool) {
+	evidence := ensureReceiptEvidence(meta, receipt)
+	if evidence.firstSeq == 0 || seq < evidence.firstSeq {
+		evidence.firstSeq = seq
+	}
+	if fromBitArray && (evidence.bitSeq == 0 || seq < evidence.bitSeq) {
+		evidence.bitSeq = seq
+	}
+}
+
+func isPropagationEvidenceKind(kind model.EventKind) bool {
+	switch kind {
+	case model.EventAddedPrevote, model.EventAddedPrecommit, model.EventObservedPrevote, model.EventObservedPrecommit:
+		return true
+	default:
+		return false
+	}
 }
 
 func BuildPropagation(
@@ -80,11 +112,12 @@ func BuildPropagation(
 	// because those receivers do log receipts and a gap is a genuine signal.
 	receiversWithData := map[string]bool{}
 	receiverRounds := map[receiverRoundKey]receiverRoundState{}
-	for _, event := range events {
+	receiptMeta := map[*model.VoteReceipt]*receiptEvidence{}
+	for idx, event := range events {
 		if event.Height != h {
 			continue
 		}
-		if event.Kind != model.EventAddedPrevote && event.Kind != model.EventAddedPrecommit {
+		if !isPropagationEvidenceKind(event.Kind) {
 			continue
 		}
 
@@ -95,13 +128,18 @@ func BuildPropagation(
 			voteType: voteType,
 		}
 		state := receiverRounds[roundKey]
-		if maj23, _ := event.Fields["_vmaj23"].(bool); maj23 {
-			state.maj23 = true
-			if !event.Timestamp.IsZero() && (state.maj23At.IsZero() || event.Timestamp.Before(state.maj23At)) {
-				state.maj23At = event.Timestamp
+		if event.Kind == model.EventAddedPrevote || event.Kind == model.EventAddedPrecommit {
+			if maj23, _ := event.Fields["_vmaj23"].(bool); maj23 {
+				state.maj23 = true
+				if !event.Timestamp.IsZero() && (state.maj23At.IsZero() || event.Timestamp.Before(state.maj23At)) {
+					state.maj23At = event.Timestamp
+				}
+				if state.maj23Seq == 0 {
+					state.maj23Seq = idx + 1
+				}
 			}
+			receiverRounds[roundKey] = state
 		}
-		receiverRounds[roundKey] = state
 
 		key, receivedAt, ok := receivedVoteKey(event, resolver)
 		row := map[string]*model.VoteReceipt(nil)
@@ -109,6 +147,9 @@ func BuildPropagation(
 			if mappedRow, found := rowByRTI[rtiKey{round: event.Round, voteType: voteType, index: idx}]; found {
 				row = mappedRow
 				key = keyByRTI[rtiKey{round: event.Round, voteType: voteType, index: idx}]
+				if receivedAt.IsZero() {
+					receivedAt = event.Timestamp
+				}
 				ok = true
 			}
 		}
@@ -136,6 +177,7 @@ func BuildPropagation(
 		if receipt.ReceivedAt.IsZero() || receivedAt.Before(receipt.ReceivedAt) {
 			receipt.ReceivedAt = receivedAt
 		}
+		recordReceiptSequence(receiptMeta, receipt, idx+1, false)
 	}
 
 	// BitArray progression pass: infer per-vote receipt times when the log format
@@ -163,7 +205,7 @@ func BuildPropagation(
 		}
 		prevBA := map[baKey]string{}
 
-		for _, ev := range events {
+		for idx, ev := range events {
 			if ev.Height != h || !ev.HasTimestamp {
 				continue
 			}
@@ -203,6 +245,7 @@ func BuildPropagation(
 							receipt.ReceivedAt = ev.Timestamp
 						}
 						receiversWithData[ev.Node] = true
+						recordReceiptSequence(receiptMeta, receipt, idx+1, true)
 						continue
 					}
 				}
@@ -226,6 +269,7 @@ func BuildPropagation(
 					receipt.ReceivedAt = ev.Timestamp
 				}
 				receiversWithData[ev.Node] = true
+				recordReceiptSequence(receiptMeta, receipt, idx+1, true)
 			}
 		}
 	}
@@ -241,21 +285,15 @@ func BuildPropagation(
 			case receipt.CastAt.IsZero():
 				receipt.Status = "unknown_cast_time"
 			case receipt.ReceivedAt.IsZero():
+				if gracePassed && roundState.maj23 {
+					receipt.Status = "quorum-satisfied"
+					break
+				}
 				// Only report "missing" when the receiver has other receipt events for
 				// this height — meaning it does log receipts and this one is genuinely
 				// absent. If the receiver has no receipt events at all, the log level is
 				// too low to draw conclusions.
 				if gracePassed && receiversWithData[receiver] {
-					if roundState.maj23 {
-						// Once the receiver already logged +2/3 precommits for the round,
-						// or +2/3 prevotes that advance the round, an extra receipt that
-						// never appears in the logs is not a reliable propagation miss
-						// signal: TM2 often moves on immediately after quorum and never
-						// emits a per-vote receipt for the surplus validator. Keep it
-						// visible in the matrix, but suppress incidents.
-						receipt.Status = "quorum-satisfied"
-						break
-					}
 					receipt.Status = "missing"
 				} else if gracePassed {
 					// Grace passed but no receipt events from this node at all —
@@ -269,19 +307,37 @@ func BuildPropagation(
 					latency = 0
 				}
 				receipt.Latency = latency
-				if roundState.maj23 && !roundState.maj23At.IsZero() && !roundState.maj23At.After(receipt.ReceivedAt) {
-					// BitArray-based receipt inference often lands on or after the same
-					// snapshot that already showed quorum. That is enough to reconstruct
-					// the round outcome, but not enough to claim a meaningful
-					// propagation delay for this specific vote.
-					receipt.Status = "quorum-satisfied"
+				if roundState.maj23 && !roundState.maj23At.IsZero() {
+					if evidence, ok := receiptMeta[receipt]; ok && evidence.bitSeq != 0 && roundState.maj23Seq != 0 {
+						switch {
+						case evidence.bitSeq > roundState.maj23Seq:
+							receipt.Status = "late"
+						default:
+							// Prefer receiver-local VoteSet progression over wall-clock
+							// timestamps: if the vote bit is already present before, or on,
+							// the first +2/3 snapshot, it was in time for that receiver's
+							// local quorum.
+							receipt.Status = "ok"
+						}
+						break
+					}
+					switch {
+					case receipt.ReceivedAt.After(roundState.maj23At):
+						// If the first concrete receipt evidence for this vote lands after
+						// the receiver's +2/3 snapshot, it was not needed to form quorum
+						// on that receiver. Surface it as late and keep the latency.
+						receipt.Status = "late"
+					case receipt.ReceivedAt.Equal(roundState.maj23At):
+						// Console timestamps are only millisecond-precise. A receipt that
+						// lands in the same tick as the first +2/3 snapshot is
+						// simultaneous/ambiguous, not provably late.
+						receipt.Status = "quorum-satisfied"
+					default:
+						receipt.Status = "ok"
+					}
 					break
 				}
-				if latency >= propagationLateThreshold {
-					receipt.Status = "late"
-				} else {
-					receipt.Status = "ok"
-				}
+				receipt.Status = "ok"
 			}
 		}
 	}
@@ -337,16 +393,30 @@ func receivedVoteKey(event model.Event, resolver *IdentityResolver) (model.VoteK
 	}
 
 	prefix, _ := event.Fields["_vaddrprefix"].(string)
-	if prefix == "" {
-		return model.VoteKey{}, time.Time{}, false
+	var identity model.ValidatorIdentity
+	var ok bool
+	if prefix != "" {
+		identity, ok = resolver.ResolveByShortAddr(prefix)
 	}
-
-	identity, ok := resolver.ResolveByShortAddr(prefix)
 	if !ok {
-		identity = model.ValidatorIdentity{
-			NodeName:  prefix,
-			ShortAddr: prefix,
+		if idx, hasIdx := event.Fields["_vidx"].(int); hasIdx && idx >= 0 {
+			if nodeName := resolver.ResolveByGenesisIndex(idx); nodeName != "" {
+				if resolved, found := resolver.ResolveByNode(nodeName); found {
+					identity = resolved
+					ok = true
+				} else {
+					identity = model.ValidatorIdentity{
+						NodeName:     nodeName,
+						GenesisIndex: idx,
+						IsValidator:  true,
+					}
+					ok = true
+				}
+			}
 		}
+	}
+	if !ok {
+		return model.VoteKey{}, time.Time{}, false
 	}
 
 	receivedAt := event.Timestamp

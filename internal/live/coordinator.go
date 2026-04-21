@@ -31,12 +31,18 @@ type Coordinator struct {
 	mu               sync.Mutex
 	rebuildMu        sync.Mutex // serializes rebuildHeight; prevents races in IncidentEngine.cards
 	rebuildGen       map[int64]int
+	refreshGen       int
 	closedAt         map[int64]time.Time
 	finalizeObserved map[int64]map[string]time.Time
 	lineSeenAt       map[string]time.Time
 	peerStatsByNode  map[string]parse.ParseStats
+	runtimeValsByIdx map[int]string
 	resolver         *IdentityResolver
 	incidents        IncidentEngine
+}
+
+type rangedEventsStore interface {
+	EventsRange(start, end int64) []model.Event
 }
 
 func (c *Coordinator) Run(ctx context.Context) error {
@@ -81,8 +87,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			c.refreshNodeStates()
-			c.refreshIncidents()
+			c.refreshDerived(false)
 		case line, ok := <-lines:
 			if !ok {
 				lines = nil
@@ -99,8 +104,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	c.flushRebuilds()
-	c.refreshNodeStatesWithMode(true)
-	c.refreshIncidents()
+	c.refreshDerived(true)
 	return nil
 }
 
@@ -117,6 +121,7 @@ func (c *Coordinator) handleLine(line source.Line) {
 
 	event, _ := parse.ParseLogLine(src, line.Raw, line.LineNo)
 	c.observePeerGossip(event)
+	c.observeRuntimeValidator(event)
 	if event.Kind == model.EventUnknown || event.Kind == model.EventKnownNoise {
 		return
 	}
@@ -161,6 +166,32 @@ func (c *Coordinator) observePeerGossip(event model.Event) {
 	}
 	parse.CollectPeerGossip(event, &stats)
 	c.peerStatsByNode[event.Node] = stats
+}
+
+func (c *Coordinator) observeRuntimeValidator(event model.Event) {
+	idx, ok := event.Fields["_vidx"].(int)
+	if !ok || idx < 0 {
+		return
+	}
+
+	addr, _ := event.Fields["validator address"].(string)
+	if addr == "" {
+		if prefix, ok := event.Fields["_vaddrprefix"].(string); ok && prefix != "" {
+			if identity, found := c.resolver.ResolveByShortAddr(prefix); found {
+				addr = identity.FullAddr
+			}
+		}
+	}
+	if addr == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.runtimeValsByIdx == nil {
+		c.runtimeValsByIdx = map[int]string{}
+	}
+	c.runtimeValsByIdx[idx] = addr
 }
 
 func (c *Coordinator) observeFinalizeCommit(event model.Event) {
@@ -267,8 +298,7 @@ func (c *Coordinator) rebuildHeight(height int64) {
 		LastUpdated: time.Now().UTC(),
 	})
 
-	c.refreshNodeStates()
-	c.refreshIncidents()
+	c.scheduleDerivedRefresh()
 }
 
 func (c *Coordinator) refreshNodeStates() {
@@ -276,21 +306,14 @@ func (c *Coordinator) refreshNodeStates() {
 }
 
 func (c *Coordinator) refreshNodeStatesWithMode(forceWallClock bool) {
-	tip := c.Store.CurrentTip()
+	tip, events := c.collectBufferedEventsWindow()
+	c.refreshNodeStatesWithEvents(forceWallClock, tip, events)
+}
+
+func (c *Coordinator) refreshNodeStatesWithEvents(forceWallClock bool, tip int64, events []model.Event) {
 	if tip <= 0 {
 		return
 	}
-
-	start := tip - int64(c.MaxHistory)
-	if start < 1 {
-		start = 1
-	}
-
-	events := make([]model.Event, 0)
-	for height := start; height <= tip; height++ {
-		events = append(events, c.Store.EventsForHeight(height)...)
-	}
-	sortEvents(events)
 
 	summaries := analyze.BuildNodeSummaries(c.Sources, events, c.snapshotPeerStats())
 
@@ -480,12 +503,25 @@ func (c *Coordinator) flushRebuilds() {
 	}
 }
 
+func (c *Coordinator) scheduleDerivedRefresh() {
+	// Height entries are updated immediately by rebuildHeight. Derived views
+	// (node summaries and incidents) are intentionally refreshed on the main
+	// coordinator ticker instead of per-height background timers: during long
+	// bootstrap replays, spawning a derived refresh after every rebuilt height
+	// causes repeated full-window rescans and heavy GC pressure.
+}
+
 func (c *Coordinator) refreshIncidents() {
+	tip, events := c.collectBufferedEventsWindow()
+	c.refreshIncidentsWithEvents(tip, events)
+}
+
+func (c *Coordinator) refreshIncidentsWithEvents(tip int64, events []model.Event) {
 	now := time.Now().UTC()
 	updates := c.incidents.Reconcile(
 		c.Store,
-		c.Store.CurrentTip(),
-		c.collectBufferedEvents(),
+		tip,
+		events,
 		c.Store.RecentHeights(0),
 		c.Store.NodeStates(),
 		now,
@@ -498,10 +534,24 @@ func (c *Coordinator) refreshIncidents() {
 	}
 }
 
+func (c *Coordinator) refreshDerived(forceWallClock bool) {
+	tip, events := c.collectBufferedEventsWindow()
+	if tip <= 0 {
+		return
+	}
+	c.refreshNodeStatesWithEvents(forceWallClock, tip, events)
+	c.refreshIncidentsWithEvents(tip, events)
+}
+
 func (c *Coordinator) collectBufferedEvents() []model.Event {
+	_, events := c.collectBufferedEventsWindow()
+	return events
+}
+
+func (c *Coordinator) collectBufferedEventsWindow() (int64, []model.Event) {
 	tip := c.Store.CurrentTip()
 	if tip <= 0 {
-		return nil
+		return 0, nil
 	}
 
 	start := tip - int64(c.MaxHistory)
@@ -509,15 +559,39 @@ func (c *Coordinator) collectBufferedEvents() []model.Event {
 		start = 1
 	}
 
+	if rangedStore, ok := c.Store.(rangedEventsStore); ok {
+		return tip, rangedStore.EventsRange(start, tip)
+	}
+
 	events := make([]model.Event, 0)
 	for height := start; height <= tip; height++ {
 		events = append(events, c.Store.EventsForHeight(height)...)
 	}
-	sortEvents(events)
-	return events
+	return tip, events
 }
 
 func (c *Coordinator) runtimeValidatorsFromBufferedEvents() []rpc.ValidatorEntry {
+	c.mu.Lock()
+	if len(c.runtimeValsByIdx) > 0 {
+		defer c.mu.Unlock()
+		maxIdx := -1
+		for idx := range c.runtimeValsByIdx {
+			if idx > maxIdx {
+				maxIdx = idx
+			}
+		}
+		if maxIdx < 0 {
+			return nil
+		}
+
+		validators := make([]rpc.ValidatorEntry, maxIdx+1)
+		for idx, addr := range c.runtimeValsByIdx {
+			validators[idx] = rpc.ValidatorEntry{Address: addr}
+		}
+		return validators
+	}
+	c.mu.Unlock()
+
 	events := c.collectBufferedEvents()
 	if len(events) == 0 {
 		return nil

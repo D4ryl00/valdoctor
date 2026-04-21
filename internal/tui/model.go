@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -33,6 +34,7 @@ type storeUpdatedMsg struct{}
 type storeEventMsg struct {
 	event storepkg.StoreEvent
 }
+type detailRefreshMsg struct{}
 
 type coordinatorErrMsg struct {
 	err error
@@ -56,6 +58,14 @@ type snapshot struct {
 type incidentItem struct {
 	card   model.IncidentCard
 	status string
+}
+
+type detailRenderCache struct {
+	height    int64
+	tab       detailTab
+	updatedAt time.Time
+	nodesRev  int
+	content   string
 }
 
 type Model struct {
@@ -84,10 +94,14 @@ type Model struct {
 	incidentSelection int
 	selectedHeight    int64
 	followLatest      bool
+	nodesRevision     int
 
 	viewport viewport.Model
 	snap     snapshot
 	err      error
+
+	detailCache detailRenderCache
+	detailRefreshScheduled bool
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -186,7 +200,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dirty = true
 			return m, nil
 		}
-		m.applyStoreEvent(msg.event)
+		return m.applyStoreEvent(msg.event)
+	case detailRefreshMsg:
+		m.detailRefreshScheduled = false
+		if m.showHelp || m.mode != viewDetail {
+			return m, nil
+		}
+		m.refreshViewport()
 		return m, nil
 	case coordinatorErrMsg:
 		m.err = msg.err
@@ -412,6 +432,7 @@ func (m *Model) reloadSnapshot() {
 		resolvedIncidents: m.store.RecentResolved(8),
 		recentHeights:     m.store.RecentHeights(32),
 	}
+	m.nodesRevision++
 
 	if (m.selectedHeight == 0 || m.followLatest) && len(m.snap.recentHeights) > 0 {
 		m.selectedHeight = m.snap.recentHeights[0].Height
@@ -429,7 +450,7 @@ func (m *Model) reloadSnapshot() {
 	}
 }
 
-func (m *Model) applyStoreEvent(event storepkg.StoreEvent) {
+func (m *Model) applyStoreEvent(event storepkg.StoreEvent) (tea.Model, tea.Cmd) {
 	refreshViewport := false
 
 	switch event.Kind {
@@ -456,6 +477,7 @@ func (m *Model) applyStoreEvent(event storepkg.StoreEvent) {
 		}
 	case "node_updated":
 		m.snap.nodes = m.store.NodeStates()
+		m.nodesRevision++
 		if m.mode == viewDetail && m.detailTab == tabPropagation {
 			refreshViewport = true
 		}
@@ -467,11 +489,12 @@ func (m *Model) applyStoreEvent(event storepkg.StoreEvent) {
 	m.reconcileIncidentSelection()
 
 	if m.showHelp {
-		return
+		return *m, nil
 	}
 	if m.mode == viewDetail && refreshViewport {
-		m.refreshViewport()
+		return m.scheduleDetailRefresh()
 	}
+	return *m, nil
 }
 
 func (m *Model) resizeViewport() {
@@ -510,9 +533,9 @@ func (m *Model) refreshViewport() {
 
 	switch m.detailTab {
 	case tabConsensus:
-		m.viewport.SetContent(renderConsensusContent(entry, m.color))
+		m.viewport.SetContent(m.detailContent(entry))
 	case tabPropagation:
-		m.viewport.SetContent(renderPropagationContent(entry, m.snap.nodes))
+		m.viewport.SetContent(m.detailContent(entry))
 	}
 	m.viewport.GotoTop()
 }
@@ -620,6 +643,46 @@ func (m *Model) reconcileIncidentSelection() {
 	} else if m.incidentSelection >= len(items) {
 		m.incidentSelection = len(items) - 1
 	}
+}
+
+func (m *Model) scheduleDetailRefresh() (tea.Model, tea.Cmd) {
+	if m.detailRefreshScheduled {
+		return *m, nil
+	}
+	m.detailRefreshScheduled = true
+	return *m, tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return detailRefreshMsg{}
+	})
+}
+
+func (m *Model) detailContent(entry model.HeightEntry) string {
+	nodesRev := 0
+	if m.detailTab == tabPropagation {
+		nodesRev = m.nodesRevision
+	}
+	if m.detailCache.height == entry.Height &&
+		m.detailCache.tab == m.detailTab &&
+		m.detailCache.updatedAt.Equal(entry.LastUpdated) &&
+		m.detailCache.nodesRev == nodesRev &&
+		m.detailCache.content != "" {
+		return m.detailCache.content
+	}
+
+	content := ""
+	switch m.detailTab {
+	case tabConsensus:
+		content = renderConsensusContent(entry, m.color)
+	case tabPropagation:
+		content = renderPropagationContent(entry, m.snap.nodes)
+	}
+	m.detailCache = detailRenderCache{
+		height:    entry.Height,
+		tab:       m.detailTab,
+		updatedAt: entry.LastUpdated,
+		nodesRev:  nodesRev,
+		content:   content,
+	}
+	return content
 }
 
 func (m Model) statusLine() string {

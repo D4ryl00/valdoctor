@@ -100,8 +100,8 @@ func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState) 
 	})
 
 	var b strings.Builder
-	b.WriteString("Vote propagation matrix\n")
-	b.WriteString("Legend: ok | late | missing | ? = unknown_cast_time | - = no receipt log data | pending\n\n")
+	b.WriteString(fmt.Sprintf("Vote propagation matrix — h%d\n", entry.Height))
+	b.WriteString("Legend: ok | late | after+2/3 | missing | ? = unknown_cast_time | - = no receipt log data | pending\n\n")
 
 	// Format: name(g1gs04) — 6-char short address in parens.
 	nodeLabel := func(name string) string {
@@ -167,6 +167,8 @@ func receiptCell(receipt *model.VoteReceipt) string {
 		return fmt.Sprintf("ok %s", receipt.Latency.Round(timeDisplayPrecision(receipt.Latency)))
 	case "late":
 		return fmt.Sprintf("late %s", receipt.Latency.Round(timeDisplayPrecision(receipt.Latency)))
+	case "quorum-satisfied":
+		return "after+2/3"
 	case "missing":
 		return "missing"
 	case "unknown_cast_time":

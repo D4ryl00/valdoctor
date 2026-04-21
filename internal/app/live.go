@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"syscall"
@@ -43,6 +44,7 @@ type liveCfg struct {
 	propagationGrace time.Duration
 	closurePolicyRaw string
 	apiAddr          string
+	cpuProfilePath   string
 	noTUI            bool
 	color            bool
 	noColor          bool
@@ -88,6 +90,7 @@ func (c *liveCfg) RegisterFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.propagationGrace, "propagation-grace", 5*time.Second, "grace window that starts when a height closes")
 	fs.StringVar(&c.closurePolicyRaw, "closure-policy", "single_validator_commit", "height closure policy: single_validator_commit, observed_validator_majority, observed_all_validator_sources")
 	fs.StringVar(&c.apiAddr, "api-addr", "", "optional HTTP listen address for the live REST/WebSocket API")
+	fs.StringVar(&c.cpuProfilePath, "cpuprofile", "", "optional path to write a CPU profile while live mode runs")
 	fs.BoolVar(&c.noTUI, "no-tui", false, "run headless and print closure progress to stdout")
 	fs.BoolVar(&c.color, "color", false, "force color output when TUI support lands")
 	fs.BoolVar(&c.noColor, "no-color", false, "disable color output when TUI support lands")
@@ -212,6 +215,22 @@ func execLive(ctx context.Context, cfg *liveCfg, io commands.IO) error {
 	defer stop()
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if strings.TrimSpace(cfg.cpuProfilePath) != "" {
+		profilePath := parse.NormalizePath(cfg.cpuProfilePath)
+		f, err := os.Create(profilePath)
+		if err != nil {
+			return fmt.Errorf("create cpuprofile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("start cpuprofile: %w", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+		}()
+	}
 
 	liveStore, closeStore, err := openLiveStore(cfg)
 	if err != nil {

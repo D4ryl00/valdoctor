@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/D4ryl00/valdoctor/internal/model"
+	storepkg "github.com/D4ryl00/valdoctor/internal/store"
 )
 
 func TestDetectActiveIncidentsSingleReceiverMissNamesVoteType(t *testing.T) {
@@ -173,4 +174,158 @@ func TestDetectActiveIncidentsResolvesOldRemoteSignerInstability(t *testing.T) {
 	active := detectActiveIncidents(55, events, nil, nodes, now)
 
 	require.NotContains(t, active, "remote-signer-instability-val5")
+}
+
+func TestDetectActiveIncidentsFlagsMissingPrevoteOnHaltedTip(t *testing.T) {
+	now := time.Now().UTC()
+	nodes := []model.NodeState{
+		{
+			Summary: model.NodeSummary{Name: "val1", Role: model.RoleValidator, HighestCommit: 46, StallDuration: 20 * time.Second},
+		},
+		{
+			Summary: model.NodeSummary{Name: "val2", Role: model.RoleValidator, HighestCommit: 46, StallDuration: 20 * time.Second},
+		},
+		{
+			Summary: model.NodeSummary{Name: "val3", Role: model.RoleValidator, HighestCommit: 46, StallDuration: 20 * time.Second},
+		},
+	}
+	heights := []model.HeightEntry{{
+		Height: 47,
+		Report: model.HeightReport{
+			Height:         47,
+			CommittedInLog: false,
+			Rounds: []model.RoundSummary{{
+				Round:         0,
+				PrevotesTotal: 2,
+				PrevotesMaj23: false,
+			}},
+			ValidatorVotes: []model.ValidatorVoteRow{
+				{
+					Name: "val2",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteBlock, Precommit: model.VoteAbsent},
+					},
+				},
+				{
+					Name: "val3",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteBlock, Precommit: model.VoteAbsent},
+					},
+				},
+				{
+					Name: "val1",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteAbsent, Precommit: model.VoteAbsent},
+					},
+				},
+			},
+		},
+	}}
+
+	active := detectActiveIncidents(47, nil, heights, nodes, now)
+
+	card, ok := active["missing-cast-prevote-val1-h47-r0"]
+	require.True(t, ok)
+	require.Equal(t, "missing-cast-prevote", card.Kind)
+	require.Equal(t, model.SeverityHigh, card.Severity)
+	require.Equal(t, "val1 did not prevote at h47/r0", card.Title)
+	require.Contains(t, card.Summary, "absent")
+}
+
+func TestDetectActiveIncidentsFlagsMissingPrecommitOnHaltedTip(t *testing.T) {
+	now := time.Now().UTC()
+	nodes := []model.NodeState{
+		{
+			Summary: model.NodeSummary{Name: "val1", Role: model.RoleValidator, HighestCommit: 51, StallDuration: 20 * time.Second},
+		},
+		{
+			Summary: model.NodeSummary{Name: "val2", Role: model.RoleValidator, HighestCommit: 51, StallDuration: 20 * time.Second},
+		},
+		{
+			Summary: model.NodeSummary{Name: "val3", Role: model.RoleValidator, HighestCommit: 51, StallDuration: 20 * time.Second},
+		},
+	}
+	heights := []model.HeightEntry{{
+		Height: 52,
+		Report: model.HeightReport{
+			Height:         52,
+			CommittedInLog: false,
+			Rounds: []model.RoundSummary{{
+				Round:             0,
+				PrevotesTotal:     3,
+				PrevotesMaj23:     true,
+				PrecommitDataSeen: true,
+				PrecommitsTotal:   2,
+				PrecommitsMaj23:   false,
+			}},
+			ValidatorVotes: []model.ValidatorVoteRow{
+				{
+					Name: "val1",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteBlock, Precommit: model.VoteAbsent},
+					},
+				},
+				{
+					Name: "val2",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteBlock, Precommit: model.VoteBlock},
+					},
+				},
+				{
+					Name: "val3",
+					ByRound: map[int]model.VoteEntry{
+						0: {Prevote: model.VoteBlock, Precommit: model.VoteBlock},
+					},
+				},
+			},
+		},
+	}}
+
+	active := detectActiveIncidents(52, nil, heights, nodes, now)
+
+	card, ok := active["missing-cast-precommit-val1-h52-r0"]
+	require.True(t, ok)
+	require.Equal(t, "missing-cast-precommit", card.Kind)
+	require.Equal(t, "val1 did not precommit at h52/r0", card.Title)
+}
+
+func TestIncidentEngineReactivatedPropagationMissStartsNewEpisode(t *testing.T) {
+	now := time.Now().UTC()
+	engine := &IncidentEngine{}
+	mem := storepkg.NewMemoryStore(8)
+
+	first := engine.Reconcile(mem, 152, nil, []model.HeightEntry{{
+		Height: 152,
+		Propagation: model.VotePropagation{
+			Height: 152,
+			Matrix: map[model.VoteKey]map[string]*model.VoteReceipt{
+				{Height: 152, Round: 0, VoteType: "precommit", OriginNode: "val4"}: {
+					"val5": {Status: "missing"},
+				},
+			},
+		},
+	}}, nil, now)
+	require.Len(t, first, 1)
+	require.Equal(t, int64(152), first[0].FirstHeight)
+	require.Equal(t, int64(152), first[0].LastHeight)
+
+	resolved := engine.Reconcile(mem, 155, nil, nil, nil, now.Add(time.Second))
+	require.Len(t, resolved, 1)
+	require.Equal(t, "resolved", resolved[0].Status)
+
+	second := engine.Reconcile(mem, 1342, nil, []model.HeightEntry{{
+		Height: 1342,
+		Propagation: model.VotePropagation{
+			Height: 1342,
+			Matrix: map[model.VoteKey]map[string]*model.VoteReceipt{
+				{Height: 1342, Round: 0, VoteType: "precommit", OriginNode: "val4"}: {
+					"val5": {Status: "missing"},
+				},
+			},
+		},
+	}}, nil, now.Add(2*time.Second))
+	require.Len(t, second, 1)
+	require.Equal(t, "active", second[0].Status)
+	require.Equal(t, int64(1342), second[0].FirstHeight)
+	require.Equal(t, int64(1342), second[0].LastHeight)
 }

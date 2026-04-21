@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -107,7 +108,7 @@ type fileState struct {
 func (f *FileSource) followOpenFile(ctx context.Context, out chan<- Line, state *fileState, applySince bool, poll time.Duration) error {
 	state.bootstraps = applySince
 	watcher, err := f.openWatcher()
-	if err == nil {
+	if err == nil && watcher != nil {
 		defer watcher.Close()
 	}
 	defer func() {
@@ -157,6 +158,12 @@ func (f *FileSource) followOpenFile(ctx context.Context, out chan<- Line, state 
 
 func (f *FileSource) openWatcher() (*fsnotify.Watcher, error) {
 	newWatcher := f.NewWatcher
+	if newWatcher == nil && runtime.GOOS == "darwin" {
+		// The default fsnotify backend on macOS is kqueue. We only need
+		// low-frequency tail-following semantics here, and polling is more
+		// predictable than kqueue for large/restarted log tails.
+		return nil, nil
+	}
 	if newWatcher == nil {
 		newWatcher = fsnotify.NewWatcher
 	}

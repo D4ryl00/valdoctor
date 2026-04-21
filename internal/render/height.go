@@ -55,14 +55,15 @@ func HeightText(report model.HeightReport, color bool) string {
 		writeNarrativeTable(&b, c, report.Rounds)
 	}
 
-	// ── Validator vote detail ────────────────────────────────────────────────
+	// ── Validator cast vote detail ───────────────────────────────────────────
 	if len(report.ValidatorVotes) > 0 && hasAnyVoteData(report.ValidatorVotes) {
-		b.WriteString("\n" + c.bold("Validator vote detail"))
+		b.WriteString("\n" + c.bold("Validator cast vote detail"))
 		if report.FocusNode != "" {
 			fmt.Fprintf(&b, " — %s\n", c.dim("single-node view: "+report.FocusNode))
 		} else {
 			fmt.Fprintf(&b, " — %s\n", c.dim("aggregate  (use --node <name> for single-node view)"))
 		}
+		fmt.Fprintf(&b, "%s\n", c.dim("  Shows each validator's observed vote for the round, not the minimal subset that first formed +2/3."))
 		if report.ValidatorSetSize > len(report.ValidatorVotes) {
 			fmt.Fprintf(&b, "%s\n", c.yellow(fmt.Sprintf(
 				"  ⚠ runtime validator set has %d members but genesis has %d — vote grid may be incomplete",
@@ -166,11 +167,11 @@ func writeClockSync(b *strings.Builder, c colorizer, rows []model.ClockSyncRow) 
 func writeNarrativeTable(b *strings.Builder, c colorizer, rounds []model.RoundSummary) {
 	// Columns: Round | Proposal | Prevote outcome | Precommit outcome | Result
 	type row struct {
-		round      string
-		proposal   string
-		prevote    string
-		precommit  string
-		result     string
+		round       string
+		proposal    string
+		prevote     string
+		precommit   string
+		result      string
 		resultColor func(string) string
 	}
 

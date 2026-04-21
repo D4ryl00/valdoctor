@@ -116,7 +116,13 @@ func TestCoordinatorEmitsPropagationIncidentAfterGrace(t *testing.T) {
 	coord := &Coordinator{
 		Source:  src,
 		Store:   memStore,
-		Genesis: model.Genesis{ChainID: "test-chain"},
+		Genesis: model.Genesis{
+			ChainID: "test-chain",
+			Validators: []model.Validator{
+				{Name: "validator-a", Address: "AAAAAAAAAAAA0000000000000000000000000000"},
+				{Name: "validator-b", Address: "BBBBBBBBBBBB0000000000000000000000000000"},
+			},
+		},
 		Sources: []model.Source{
 			{Path: "/tmp/validator-a.log", Node: "validator-a", Role: model.RoleValidator},
 			{Path: "/tmp/validator-b.log", Node: "validator-b", Role: model.RoleValidator},

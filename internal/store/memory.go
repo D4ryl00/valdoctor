@@ -74,6 +74,49 @@ func (s *MemoryStore) EventsForHeight(h int64) []model.Event {
 	return out
 }
 
+func (s *MemoryStore) EventsRange(start, end int64) []model.Event {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if end < start {
+		return nil
+	}
+
+	total := 0
+	for _, height := range s.keys {
+		if height < start {
+			continue
+		}
+		if height > end {
+			break
+		}
+		bucket := s.heights[height]
+		if bucket == nil {
+			continue
+		}
+		total += len(bucket.events)
+	}
+	if total == 0 {
+		return nil
+	}
+
+	out := make([]model.Event, 0, total)
+	for _, height := range s.keys {
+		if height < start {
+			continue
+		}
+		if height > end {
+			break
+		}
+		bucket := s.heights[height]
+		if bucket == nil || len(bucket.events) == 0 {
+			continue
+		}
+		out = append(out, bucket.events...)
+	}
+	return out
+}
+
 func (s *MemoryStore) SetHeightEntry(e model.HeightEntry) error {
 	s.mu.Lock()
 	bucket := s.heights[e.Height]

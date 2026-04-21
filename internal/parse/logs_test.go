@@ -138,6 +138,53 @@ func TestParseJSONLineClassifiesSignedVote(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestParseConsoleLineClassifiesLastPrecommitsAsPrecommitEvidence(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "val5", Role: model.RoleValidator}
+	line := "val5-1  | 2026-04-21T00:02:23.627Z\t\x1b[34mINFO \x1b[0m\tAdded to lastPrecommits: VoteSet{H:1342 R:0 T:2 +2/3:6B8F4DF0A6060AFD632900CC998BBADA59D12BF215772AD137B909D75E3D6C14:1:6BD05228F3A2(1) BA{5:xxxxx} map[]}\t{\"module\":\"consensus\"}"
+
+	event, warning := ParseLogLine(source, line, 201)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventAddedPrecommit, event.Kind)
+	require.EqualValues(t, 1342, event.Height)
+	require.Equal(t, 0, event.Round)
+	require.Equal(t, "precommit", event.Fields["_vote_type"])
+	require.Equal(t, 5, event.Fields["_vrecv"])
+	require.Equal(t, 5, event.Fields["_vtotal"])
+	require.Equal(t, true, event.Fields["_vmaj23"])
+	require.Equal(t, "xxxxx", event.Fields["_vbits"])
+}
+
+func TestParseConsoleLineClassifiesSetHasVoteAsObservedVoteEvidence(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "val2", Role: model.RoleValidator}
+	line := "val2-1  | 2026-04-21T09:08:14.073Z\tDEBUG\tsetHasVote\t{\"module\":\"consensus\",\"peerH/R\":\"1118/0\",\"H/R\":\"1118/0\",\"type\":1,\"index\":4}"
+
+	event, warning := ParseLogLine(source, line, 101)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventObservedPrevote, event.Kind)
+	require.EqualValues(t, 1118, event.Height)
+	require.Equal(t, 0, event.Round)
+	require.Equal(t, "prevote", event.Fields["_vote_type"])
+	require.Equal(t, 4, event.Fields["_vidx"])
+}
+
+func TestParseConsoleLineClassifiesSendingVoteAsObservedVoteEvidence(t *testing.T) {
+	source := model.Source{Path: "/tmp/validator.log", Node: "val2", Role: model.RoleValidator}
+	line := "val2-1  | 2026-04-21T09:08:14.151Z\tDEBUG\tSending vote message\t{\"module\":\"consensus\",\"vote\":\"Vote{4:C4F822B35F6C 1118/00/1(Prevote) 9B47FA716CC9 66B9929C9829 @ 2026-04-21T09:08:13.964700885Z}\"}"
+
+	event, warning := ParseLogLine(source, line, 102)
+
+	require.Empty(t, warning)
+	require.Equal(t, model.EventObservedPrevote, event.Kind)
+	require.EqualValues(t, 1118, event.Height)
+	require.Equal(t, 0, event.Round)
+	require.Equal(t, "prevote", event.Fields["_vote_type"])
+	require.Equal(t, 4, event.Fields["_vidx"])
+	require.Equal(t, "C4F822B35F6C", event.Fields["_vaddrprefix"])
+	require.Equal(t, "9B47FA716CC9", event.Fields["_vhash"])
+}
+
 func TestParseJSONLineClassifiesPeerConfigError(t *testing.T) {
 	source := model.Source{Path: "/tmp/validator.log", Node: "validator_1", Role: model.RoleValidator}
 	line := `{"level":"error","ts":1775590325.1591926,"msg":"invalid persistent peer address","err":"invalid net address"}`

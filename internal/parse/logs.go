@@ -49,6 +49,10 @@ var (
 	// HASH is a hex string or "<nil>" for nil votes.
 	// The optional /TYPE integer before (TypeName) is present in some gnoland versions.
 	voteDetailRE = regexp.MustCompile(`Vote\{(\d+):([0-9A-Fa-f]+) \d+/\d+(?:/\d+)?\(\w+\) ([0-9A-Fa-f]+|<nil>)`)
+	// voteEnvelopeRE extracts validator index, address fingerprint, height,
+	// round, type name, and block hash from raw vote strings such as
+	// "Vote{IDX:ADDRSHORT HEIGHT/ROUND/TYPE(TypeName) HASH ...}".
+	voteEnvelopeRE = regexp.MustCompile(`Vote\{(\d+):([0-9A-Fa-f]+) (\d+)/(\d+)(?:/\d+)?\((\w+)\) ([0-9A-Fa-f]+|<nil>)`)
 	// voteReceiveRE extracts validator index, address fingerprint, height, round,
 	// type name, and block hash from "Receive" (consensus) messages.
 	// Format: [Vote Vote{IDX:ADDRSHORT HEIGHT/ROUND/TYPE(TypeName) BLOCKHASH SIG @ TS}]
@@ -275,7 +279,7 @@ func parseJSONLine(source model.Source, clean string, lineNo int) (model.Event, 
 	if len(payload) > 0 {
 		event.Fields = payload
 	}
-	event.Kind = classifyMessage(classificationMessage(event.Message, event.Fields))
+	event.Kind = classifyEvent(classificationMessage(event.Message, event.Fields), event.Fields)
 	enrichEvent(&event)
 	if event.Kind == model.EventUnknown {
 		return event, fmt.Sprintf("%s:%d: unclassified json message %q", source.Path, lineNo, event.Message)
@@ -315,7 +319,7 @@ func parseConsoleLine(source model.Source, clean string, lineNo int) (model.Even
 	if len(fields) > 0 {
 		event.Fields = fields
 	}
-	event.Kind = classifyMessage(classificationMessage(event.Message, event.Fields))
+	event.Kind = classifyEvent(classificationMessage(event.Message, event.Fields), event.Fields)
 	enrichEvent(&event)
 	if event.Kind == model.EventUnknown {
 		return event, fmt.Sprintf("%s:%d: unclassified console message %q", source.Path, lineNo, event.Message)
@@ -334,6 +338,30 @@ func classificationMessage(message string, fields map[string]any) string {
 		return inner
 	}
 	return msg
+}
+
+func classifyEvent(msg string, fields map[string]any) model.EventKind {
+	if strings.Contains(msg, "setHasVote") {
+		switch normalizeVoteType(fields["type"]) {
+		case "prevote":
+			return model.EventObservedPrevote
+		case "precommit":
+			return model.EventObservedPrecommit
+		}
+	}
+	if strings.Contains(msg, "Sending vote message") {
+		voteStr, _ := fields["vote"].(string)
+		if voteStr == "" {
+			voteStr = msg
+		}
+		switch voteTypeFromVoteString(voteStr) {
+		case "prevote":
+			return model.EventObservedPrevote
+		case "precommit":
+			return model.EventObservedPrecommit
+		}
+	}
+	return classifyMessage(msg)
 }
 
 func baseEvent(source model.Source, lineNo int) model.Event {
@@ -573,7 +601,7 @@ func classifyMessage(msg string) model.EventKind {
 	// ── Known noise — voting bookkeeping ──────────────────────────────────
 	// Source: tm2/pkg/bft/consensus/state.go, reactor.go
 	case strings.Contains(msg, "Added to lastPrecommits:"):
-		return model.EventKnownNoise
+		return model.EventAddedPrecommit
 	case strings.Contains(msg, "setHasVote"):
 		return model.EventKnownNoise
 	case strings.Contains(msg, "addVote"):
@@ -812,6 +840,53 @@ func enrichEvent(event *model.Event) {
 		}
 	}
 
+	if event.Kind == model.EventObservedPrevote || event.Kind == model.EventObservedPrecommit {
+		if event.Fields == nil {
+			event.Fields = map[string]any{}
+		}
+		if event.Kind == model.EventObservedPrevote {
+			event.Fields["_vote_type"] = "prevote"
+		} else {
+			event.Fields["_vote_type"] = "precommit"
+		}
+		if idx, ok := event.Fields["index"]; ok {
+			if parsed, ok := toInt64(idx); ok && parsed >= 0 {
+				event.Fields["_vidx"] = int(parsed)
+			}
+		}
+		if hr, ok := event.Fields["H/R"].(string); ok && hr != "" {
+			if h, r, ok := extractSlashHeightRound(hr); ok {
+				if event.Height == 0 {
+					event.Height = h
+				}
+				if event.Round == 0 {
+					event.Round = r
+				}
+			}
+		}
+
+		voteStr, _ := event.Fields["vote"].(string)
+		if voteStr == "" {
+			voteStr = classifyMsg
+		}
+		if m := voteEnvelopeRE.FindStringSubmatch(voteStr); m != nil {
+			idx, _ := strconv.Atoi(m[1])
+			event.Fields["_vidx"] = idx
+			event.Fields["_vaddrprefix"] = strings.ToUpper(m[2])
+			if h, err := strconv.ParseInt(m[3], 10, 64); err == nil && event.Height == 0 {
+				event.Height = h
+			}
+			if r, err := strconv.Atoi(m[4]); err == nil && event.Round == 0 {
+				event.Round = r
+			}
+			if m[6] == "<nil>" || strings.Trim(m[6], "0") == "" {
+				event.Fields["_vhash"] = ""
+			} else {
+				event.Fields["_vhash"] = strings.ToUpper(m[6])
+			}
+		}
+	}
+
 	// For prevote/precommit events, parse the VoteSet string to extract vote counts,
 	// and parse the individual vote to extract validator index + block hash.
 	if event.Kind == model.EventAddedPrevote || event.Kind == model.EventAddedPrecommit {
@@ -827,7 +902,11 @@ func enrichEvent(event *model.Event) {
 		if event.Kind == model.EventAddedPrecommit {
 			fieldName = "precommits"
 		}
-		if vs, ok := event.Fields[fieldName].(string); ok {
+		vs, _ := event.Fields[fieldName].(string)
+		if vs == "" {
+			vs = classifyMsg
+		}
+		if vs != "" {
 			recv, total, maj23, maj23Hash, bits := parseVoteSet(vs)
 			if total > 0 {
 				event.Fields["_vrecv"] = recv
@@ -835,6 +914,16 @@ func enrichEvent(event *model.Event) {
 				event.Fields["_vmaj23"] = maj23
 				event.Fields["_vmaj23hash"] = maj23Hash
 				event.Fields["_vbits"] = bits
+			}
+			if event.Height == 0 || event.Round == 0 {
+				if h, r, ok := extractVoteSetHeightRound(vs); ok {
+					if event.Height == 0 {
+						event.Height = h
+					}
+					if event.Round == 0 {
+						event.Round = r
+					}
+				}
 			}
 		}
 		// Extract per-validator detail: index, address fingerprint, and voted block hash.
@@ -964,6 +1053,36 @@ func parseVoteSet(s string) (received, total int, maj23 bool, maj23Hash string, 
 		}
 	}
 	return
+}
+
+func extractVoteSetHeightRound(s string) (int64, int, bool) {
+	start := strings.Index(s, "VoteSet{H:")
+	if start < 0 {
+		return 0, 0, false
+	}
+	s = s[start:]
+	var h int64
+	var r int
+	if _, err := fmt.Sscanf(s, "VoteSet{H:%d R:%d", &h, &r); err != nil {
+		return 0, 0, false
+	}
+	return h, r, true
+}
+
+func extractSlashHeightRound(s string) (int64, int, bool) {
+	var h int64
+	var r int
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d/%d", &h, &r); err != nil {
+		return 0, 0, false
+	}
+	return h, r, true
+}
+
+func voteTypeFromVoteString(s string) string {
+	if m := voteEnvelopeRE.FindStringSubmatch(s); m != nil {
+		return normalizeVoteType(m[5])
+	}
+	return ""
 }
 
 func extractHeight(msg string, fields map[string]any) int64 {

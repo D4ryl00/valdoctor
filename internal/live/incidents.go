@@ -52,15 +52,22 @@ func (e *IncidentEngine) Reconcile(
 	for id, next := range active {
 		prev, ok := e.cards[id]
 		if ok {
-			next.FirstHeight = prev.FirstHeight
-			if next.FirstHeight == 0 {
-				next.FirstHeight = next.LastHeight
-			}
-			if next.LastHeight < prev.LastHeight {
-				next.LastHeight = prev.LastHeight
-			}
 			if prev.Status == "resolved" {
+				// A reactivated incident is a new episode. Reusing the old first
+				// height makes the active card look like one continuous fault
+				// spanning large gaps, which is misleading for intermittent
+				// propagation misses.
+				if next.FirstHeight == 0 {
+					next.FirstHeight = next.LastHeight
+				}
+			} else {
 				next.FirstHeight = prev.FirstHeight
+				if next.FirstHeight == 0 {
+					next.FirstHeight = next.LastHeight
+				}
+				if next.LastHeight < prev.LastHeight {
+					next.LastHeight = prev.LastHeight
+				}
 			}
 			if cardsEqual(prev, next) {
 				e.cards[id] = next
@@ -244,7 +251,91 @@ func detectActiveIncidents(
 		accumulatePropagationIncidents(active, height, nodes, tip, now)
 	}
 
+	accumulateMissingCastIncidents(active, tip, heights, nodes, now)
+
 	return active
+}
+
+func accumulateMissingCastIncidents(active map[string]model.IncidentCard, tip int64, heights []model.HeightEntry, nodes []model.NodeState, now time.Time) {
+	if tip <= 0 {
+		return
+	}
+
+	var tipHeight *model.HeightEntry
+	for i := range heights {
+		if heights[i].Height == tip {
+			tipHeight = &heights[i]
+			break
+		}
+	}
+	if tipHeight == nil || tipHeight.Report.CommittedInLog {
+		return
+	}
+
+	stalledValidators := map[string]bool{}
+	for _, node := range nodes {
+		if node.Summary.Role != model.RoleValidator {
+			continue
+		}
+		if tip > node.Summary.HighestCommit && node.Summary.StallDuration >= node.Summary.StallThreshold() {
+			stalledValidators[node.Summary.Name] = true
+		}
+	}
+	if len(stalledValidators) == 0 {
+		return
+	}
+
+	for _, round := range tipHeight.Report.Rounds {
+		switch {
+		case round.PrevotesTotal > 0 && !round.PrevotesMaj23:
+			addMissingCastIncidentRows(active, now, tipHeight.Height, round.Round, "prevote", tipHeight.Report.ValidatorVotes, stalledValidators)
+		case round.PrevotesMaj23 && round.PrecommitDataSeen && !round.PrecommitsMaj23:
+			addMissingCastIncidentRows(active, now, tipHeight.Height, round.Round, "precommit", tipHeight.Report.ValidatorVotes, stalledValidators)
+		}
+	}
+}
+
+func addMissingCastIncidentRows(
+	active map[string]model.IncidentCard,
+	now time.Time,
+	height int64,
+	round int,
+	voteType string,
+	rows []model.ValidatorVoteRow,
+	stalledValidators map[string]bool,
+) {
+	for _, row := range rows {
+		name := strings.TrimSpace(row.Name)
+		if name == "" || !stalledValidators[name] {
+			continue
+		}
+		entry, ok := row.ByRound[round]
+		if !ok {
+			continue
+		}
+
+		kind := entry.Prevote
+		if voteType == "precommit" {
+			kind = entry.Precommit
+		}
+		if kind != model.VoteAbsent {
+			continue
+		}
+
+		id := fmt.Sprintf("missing-cast-%s-%s-h%d-r%d", voteType, name, height, round)
+		active[id] = model.IncidentCard{
+			ID:          id,
+			Kind:        "missing-cast-" + voteType,
+			Severity:    model.SeverityHigh,
+			Status:      "active",
+			Scope:       name,
+			Title:       fmt.Sprintf("%s did not %s at h%d/r%d", name, voteType, height, round),
+			Summary:     fmt.Sprintf("%s was absent in the aggregate %s vote grid while consensus remained uncommitted at h%d/r%d.", name, voteType, height, round),
+			FirstHeight: height,
+			LastHeight:  height,
+			UpdatedAt:   now,
+		}
+	}
 }
 
 func accumulatePropagationIncidents(active map[string]model.IncidentCard, height model.HeightEntry, nodes []model.NodeState, tip int64, now time.Time) {

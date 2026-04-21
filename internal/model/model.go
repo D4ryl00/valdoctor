@@ -122,6 +122,8 @@ const (
 	EventFastSyncBlockError     EventKind = "fastsync_block_validation_error"
 	EventAddedPrevote           EventKind = "added_prevote"
 	EventAddedPrecommit         EventKind = "added_precommit"
+	EventObservedPrevote        EventKind = "observed_prevote"
+	EventObservedPrecommit      EventKind = "observed_precommit"
 	EventCommitUnknownBlock     EventKind = "commit_unknown_block"
 	EventCommitLockedBlock      EventKind = "commit_locked_block"
 	EventUnexpectedBlockPart    EventKind = "unexpected_block_part"

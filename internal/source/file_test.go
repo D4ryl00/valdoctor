@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -175,6 +176,24 @@ func TestFileSourceFallsBackToPollingWhenWatcherSetupFails(t *testing.T) {
 		require.NoError(t, err)
 	default:
 	}
+}
+
+func TestFileSourceOpenWatcherUsesPollingOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin-specific watcher policy")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.log")
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o644))
+
+	src := &FileSource{
+		Source: model.Source{Path: path, Node: "validator-a", Role: model.RoleValidator},
+	}
+
+	watcher, err := src.openWatcher()
+	require.NoError(t, err)
+	require.Nil(t, watcher)
 }
 
 func appendLine(t *testing.T, path, line string) {
