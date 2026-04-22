@@ -12,6 +12,7 @@ type styles struct {
 	muted        lipgloss.Style
 	sectionTitle lipgloss.Style
 	tableHeader  lipgloss.Style
+	warning      lipgloss.Style
 	selected     lipgloss.Style
 	activeChip   lipgloss.Style
 	resolvedChip lipgloss.Style
@@ -34,6 +35,7 @@ func newStyles(color bool) styles {
 			muted:        lipgloss.NewStyle().Faint(true),
 			sectionTitle: lipgloss.NewStyle().Bold(true),
 			tableHeader:  lipgloss.NewStyle().Bold(true),
+			warning:      lipgloss.NewStyle().Bold(true),
 			selected:     lipgloss.NewStyle().Bold(true),
 			activeChip:   base.Bold(true),
 			resolvedChip: base.Bold(true),
@@ -54,6 +56,7 @@ func newStyles(color bool) styles {
 		muted:        lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 		sectionTitle: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("74")),
 		tableHeader:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")),
+		warning:      lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("215")),
 		selected:     lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("230")),
 		activeChip:   base.Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("160")),
 		resolvedChip: base.Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("241")),

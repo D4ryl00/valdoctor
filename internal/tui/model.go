@@ -671,9 +671,9 @@ func (m *Model) detailContent(entry model.HeightEntry) string {
 	content := ""
 	switch m.detailTab {
 	case tabConsensus:
-		content = renderConsensusContent(entry, m.color)
+		content = renderConsensusContent(entry, m.styles)
 	case tabPropagation:
-		content = renderPropagationContent(entry, m.snap.nodes)
+		content = renderPropagationContent(entry, m.snap.nodes, m.styles)
 	}
 	m.detailCache = detailRenderCache{
 		height:    entry.Height,

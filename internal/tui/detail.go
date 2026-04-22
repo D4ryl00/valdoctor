@@ -42,13 +42,41 @@ func detailSelectionMode(m Model) string {
 	return "pinned"
 }
 
-func renderConsensusContent(entry model.HeightEntry, color bool) string {
-	return render.HeightText(entry.Report, color)
+func renderConsensusContent(entry model.HeightEntry, theme styles) string {
+	raw := render.HeightText(entry.Report, false)
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+
+	styled := make([]string, 0, len(lines))
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case i == 0 && strings.HasPrefix(trimmed, "Height "):
+			continue
+		case trimmed == "":
+			styled = append(styled, "")
+		case strings.HasPrefix(trimmed, "Block:"):
+			styled = append(styled, theme.muted.Render(line))
+		case isConsensusSectionLine(trimmed):
+			styled = append(styled, theme.sectionTitle.Render(trimmed))
+		case isConsensusTableHeaderLine(trimmed):
+			styled = append(styled, theme.tableHeader.Render(line))
+		case isBoxRule(trimmed):
+			styled = append(styled, theme.muted.Render(line))
+		case isConsensusWarningLine(trimmed):
+			styled = append(styled, theme.warning.Render(line))
+		case isConsensusMutedLine(trimmed):
+			styled = append(styled, theme.muted.Render(line))
+		default:
+			styled = append(styled, line)
+		}
+	}
+
+	return strings.Join(styled, "\n")
 }
 
-func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState) string {
+func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState, theme styles) string {
 	if len(entry.Propagation.Matrix) == 0 {
-		return "No propagation data for this height yet."
+		return theme.muted.Render("No propagation data for this height yet.")
 	}
 
 	// Build per-node lookups from the node state snapshot.
@@ -100,8 +128,10 @@ func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState) 
 	})
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Vote propagation matrix — h%d\n", entry.Height))
-	b.WriteString("Legend: ok | late | after+2/3 | missing | ? = unknown_cast_time | - = no receipt log data | pending\n\n")
+	b.WriteString(theme.sectionTitle.Render(fmt.Sprintf("Vote propagation matrix — h%d", entry.Height)))
+	b.WriteString("\n")
+	b.WriteString(theme.muted.Render("Legend: ok | late | after+2/3 | missing | ? = unknown_cast_time | - = no receipt log data | pending"))
+	b.WriteString("\n\n")
 
 	// Format: name(g1gs04) — 6-char short address in parens.
 	nodeLabel := func(name string) string {
@@ -120,8 +150,8 @@ func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState) 
 		}
 		header += fmt.Sprintf(" %-14s", recvLabel)
 	}
-	b.WriteString(header + "\n")
-	b.WriteString(strings.Repeat("─", len(header)) + "\n")
+	b.WriteString(theme.tableHeader.Render(header) + "\n")
+	b.WriteString(theme.muted.Render(strings.Repeat("─", len(header))) + "\n")
 
 	for _, key := range keys {
 		row := entry.Propagation.Matrix[key]
@@ -133,6 +163,77 @@ func renderPropagationContent(entry model.HeightEntry, nodes []model.NodeState) 
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func isConsensusSectionLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "Clock synchronisation"):
+		return true
+	case strings.HasPrefix(line, "Consensus narrative"):
+		return true
+	case strings.HasPrefix(line, "Validator cast vote detail"):
+		return true
+	case strings.HasPrefix(line, "Peer connections during block"):
+		return true
+	case strings.HasPrefix(line, "Commit signatures"):
+		return true
+	case strings.HasPrefix(line, "Transactions"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isConsensusTableHeaderLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "Round "):
+		return true
+	case strings.HasPrefix(line, "Validator [idx]"):
+		return true
+	case strings.HasPrefix(line, "Node"):
+		return true
+	case strings.HasPrefix(line, "Idx "):
+		return true
+	case strings.HasPrefix(line, "Tx "):
+		return true
+	default:
+		return false
+	}
+}
+
+func isConsensusWarningLine(line string) bool {
+	return strings.HasPrefix(line, "warn:") || strings.HasPrefix(line, "⚠")
+}
+
+func isConsensusMutedLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "(aggregate"):
+		return true
+	case strings.HasPrefix(line, "(single-node view:"):
+		return true
+	case strings.HasPrefix(line, "Shows each validator's observed vote"):
+		return true
+	case strings.HasPrefix(line, "vote bitmap labels use"):
+		return true
+	case strings.Contains(line, "[from RPC /commit]"):
+		return true
+	case strings.Contains(line, "[from RPC /block_results]"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isBoxRule(line string) bool {
+	if line == "" {
+		return false
+	}
+	for _, r := range line {
+		if r != '─' {
+			return false
+		}
+	}
+	return true
 }
 
 func recentHeightList(m Model) string {
